@@ -118,6 +118,129 @@ function parseButtons(text) {
   return keyboard;
 }
 
+function telegramEntitiesToHtml(text, entities) {
+  if (!text) return "";
+  if (!entities || entities.length === 0) {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  const inserts = {};
+  
+  for (const entity of entities) {
+    const start = entity.offset;
+    const end = entity.offset + entity.length;
+    
+    let openTag = "";
+    let closeTag = "";
+    
+    switch (entity.type) {
+      case "bold":
+        openTag = "<b>";
+        closeTag = "</b>";
+        break;
+      case "italic":
+        openTag = "<i>";
+        closeTag = "</i>";
+        break;
+      case "underline":
+        openTag = "<u>";
+        closeTag = "</u>";
+        break;
+      case "strikethrough":
+        openTag = "<s>";
+        closeTag = "</s>";
+        break;
+      case "spoiler":
+        openTag = "<tg-spoiler>";
+        closeTag = "</tg-spoiler>";
+        break;
+      case "code":
+        openTag = "<code>";
+        closeTag = "</code>";
+        break;
+      case "blockquote":
+        openTag = "<blockquote>";
+        closeTag = "</blockquote>";
+        break;
+      case "pre":
+        if (entity.language) {
+          openTag = `<pre><code class="language-${entity.language}">`;
+        } else {
+          openTag = "<pre>";
+        }
+        closeTag = entity.language ? "</code></pre>" : "</pre>";
+        break;
+      case "text_link":
+        openTag = `<a href="${entity.url}">`;
+        closeTag = "</a>";
+        break;
+      default:
+        break;
+    }
+    
+    if (openTag) {
+      if (!inserts[start]) inserts[start] = [];
+      inserts[start].push({ type: "open", tag: openTag, entity });
+    }
+    if (closeTag) {
+      if (!inserts[end]) inserts[end] = [];
+      inserts[end].push({ type: "close", tag: closeTag, entity });
+    }
+  }
+
+  let result = "";
+  for (let i = 0; i <= text.length; i++) {
+    if (inserts[i]) {
+      const events = inserts[i];
+      const closeEvents = events.filter(e => e.type === "close");
+      const openEvents = events.filter(e => e.type === "open");
+
+      openEvents.sort((a, b) => b.entity.length - a.entity.length);
+      closeEvents.sort((a, b) => b.entity.offset - a.entity.offset);
+
+      for (const ev of closeEvents) {
+        result += ev.tag;
+      }
+      for (const ev of openEvents) {
+        result += ev.tag;
+      }
+    }
+
+    if (i < text.length) {
+      const char = text[i];
+      if (char === "&") {
+        result += "&amp;";
+      } else if (char === "<") {
+        result += "&lt;";
+      } else if (char === ">") {
+        result += "&gt;";
+      } else {
+        result += char;
+      }
+    }
+  }
+
+  return result;
+}
+
+function parseMarkdownToHtml(text) {
+  if (!text) return "";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+    .replace(/__(.*?)__/g, "<b>$1</b>")
+    .replace(/\*(.*?)\*/g, "<i>$1</i>")
+    .replace(/_(.*?)_/g, "<i>$1</i>")
+    .replace(/`(.*?)`/g, "<code>$1</code>")
+    .replace(/\|\|(.*?)\|\|/g, "<tg-spoiler>$1</tg-spoiler>")
+    .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>');
+}
+
 function parseDateTimeWithOffset(dateStr, offsetMinutes) {
   if (!dateStr) return null;
   // Normalize Persian/Arabic digits to English digits
@@ -541,7 +664,7 @@ async function handleCallback(data, user, state, draft, message, env) {
     else if (type === "sticker") typePersian = "استیکر";
     else if (type === "voice") typePersian = "ویس (صدای ضبط شده)";
 
-    const text = `✍️ <b>ارسال محتوای پست (${typePersian})</b>\n\nلطفاً پیام خود را به عنوان محتوای پست ارسال کنید.\nمیتوانید از فرمتبندی استاندارد HTML تلگرام استفاده کنید:\n\n- <code>&lt;b&gt;bold&lt;/b&gt;</code>\n- <code>&lt;i&gt;italic&lt;/i&gt;</code>\n- <code>&lt;u&gt;underline&lt;/u&gt;</code>\n- <code>&lt;s&gt;strikethrough&lt;/s&gt;</code>\n- <code>&lt;a href=\"URL\"&gt;link&lt;/a&gt;</code>`;
+    const text = `✍️ <b>ارسال محتوای پست (${typePersian})</b>\n\nلطفاً پیام خود را ارسال یا فوروارد کنید.\n\n🌟 <b>تشخیص خودکار قالب‌بندی:</b>\nربات به طور خودکار قالب‌بندی پیام شما را (شامل <b>bold</b>، <i>italic</i>، <u>underline</u>، <s>strikethrough</s>، نقل‌قول blockquote، لینک‌ها، متون مخفی spoiler و...) شناسایی و حفظ می‌کند.\n\n✍️ همچنین می‌توانید از قالب‌بندی استاندارد تلگرام یا <b>مارک‌داون</b> (مثل <code>**متن**</code> برای بولد یا <code>_متن_</code> برای مورب) استفاده کنید.`;
     
     await editMessage(env, chatId, msgId, text, {
       reply_markup: {
@@ -1034,12 +1157,11 @@ async function handleMessage(message, user, state, draft, env) {
     let postText = message.text || message.caption || "";
 
     // Keep HTML tags if rich formatting exists
-    if (message.entities || message.caption_entities) {
-      // Telegram format is complex, we use raw caption if text has formatting.
-      // In CF Workers, parsing HTML or markdown formatting dynamically from Telegram entities
-      // can be elegantly solved by transforming entity bounds.
-      // But we can fallback to preserving user inputs or using HTML parse mode on message text directly
-      // if they write in HTML tags directly.
+    const entities = message.entities || message.caption_entities;
+    if (entities && entities.length > 0) {
+      postText = telegramEntitiesToHtml(postText, entities);
+    } else {
+      postText = parseMarkdownToHtml(postText);
     }
 
     if (type === "photo" && message.photo) {

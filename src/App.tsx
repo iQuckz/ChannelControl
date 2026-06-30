@@ -173,6 +173,21 @@ function calculatePresetTimestamp(preset: string, offsetMinutes: number): number
   return nowUtc;
 }
 
+function parseMarkdownToHtml(text: string): string {
+  if (!text) return "";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+    .replace(/__(.*?)__/g, "<b>$1</b>")
+    .replace(/\*(.*?)\*/g, "<i>$1</i>")
+    .replace(/_(.*?)_/g, "<i>$1</i>")
+    .replace(/`(.*?)`/g, "<code>$1</code>")
+    .replace(/\|\|(.*?)\|\|/g, "<tg-spoiler>$1</tg-spoiler>")
+    .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>');
+}
+
 export default function App() {
   // Config & Variable Customization State
   const [botToken, setBotToken] = useState("123456789:ABCdefGhIJKlmNoPQRsTuvWxYz");
@@ -435,7 +450,7 @@ export default function App() {
         else if (type === "sticker") typePersian = "استیکر";
         else if (type === "voice") typePersian = "ویس (صدای ضبط شده)";
 
-        addMsg("bot", `✍️ <b>ارسال محتوای پست (${typePersian})</b>\n\nلطفاً پیام خود را به عنوان محتوای پست ارسال کنید.\nمیتوانید از فرمتبندی استاندارد HTML تلگرام استفاده کنید:\n\n- <code>&lt;b&gt;bold&lt;/b&gt;</code>\n- <code>&lt;i&gt;italic&lt;/i&gt;</code>\n- <code>&lt;u&gt;underline&lt;/u&gt;</code>\n- <code>&lt;a href=\"URL\"&gt;link&lt;/a&gt;</code>\n\n<b>هم‌اکنون پیام/فایل خود را در چت تایپ کنید و بفرستید:</b>`);
+        addMsg("bot", `✍️ <b>ارسال محتوای پست (${typePersian})</b>\n\nلطفاً پیام خود را ارسال یا فوروارد کنید.\n\n🌟 <b>تشخیص خودکار قالب‌بندی:</b>\nربات به طور خودکار قالب‌بندی پیام شما را (شامل <b>bold</b>، <i>italic</i>، <u>underline</u>، <s>strikethrough</s>، نقل‌قول blockquote، لینک‌ها، متون مخفی spoiler و...) شناسایی و حفظ می‌کند.\n\n✍️ همچنین می‌توانید از قالب‌بندی استاندارد تلگرام یا <b>مارک‌داون</b> (مثل <code>**متن**</code> برای بولد یا <code>_متن_</code> برای مورب) استفاده کنید.\n\n<b>هم‌اکنون پیام/فایل خود را در چت تایپ کنید و بفرستید:</b>`);
         return;
       }
 
@@ -755,7 +770,8 @@ export default function App() {
 
       // Step: AWAITING_CONTENT
       if (state.step === "AWAITING_CONTENT") {
-        setDraft(prev => ({ ...prev, text: txt }));
+        const formattedTxt = parseMarkdownToHtml(txt);
+        setDraft(prev => ({ ...prev, text: formattedTxt }));
         
         if (draft.contentType === "text") {
           askButtonsChoiceSim();
