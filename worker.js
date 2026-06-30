@@ -552,6 +552,11 @@ async function handleCallback(data, user, state, draft, message, env) {
     return;
   }
 
+  if (data === "settings_tz_menu") {
+    await handleTzMenu(env, chatId, msgId);
+    return;
+  }
+
   if (data.startsWith("settings_tz_")) {
     const tz = data.replace("settings_tz_", "");
     let offset = 0;
@@ -1642,16 +1647,6 @@ async function handleTzMenu(env, chatId, editMsgId) {
   ];
   await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
 }
-
-// Intercept specific custom settings routing
-const originalHandleCallback = handleCallback;
-handleCallback = async function(data, user, state, draft, message, env) {
-  if (data === "settings_tz_menu") {
-    await handleTzMenu(env, message.chat.id, message.message_id);
-    return;
-  }
-  await originalHandleCallback(data, user, state, draft, message, env);
-};
 
 /**
  * CRON TRIGGER EXECUTION (process due posts)
