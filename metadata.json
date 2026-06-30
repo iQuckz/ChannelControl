@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Channel Manager Bot Builder",
+  "description": "An interactive simulator, code generator, and setup guide for a Telegram channel management bot running on Cloudflare Workers and KV.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

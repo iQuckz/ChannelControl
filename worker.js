@@ -1,0 +1,1442 @@
+/**
+ * Cloudflare Worker: Telegram Channel Manager Bot
+ * runs 100% on Cloudflare Workers and KV
+ */
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // GET /health
+    if (request.method === "GET" && url.pathname === "/health") {
+      return new Response(JSON.stringify({ status: "healthy", time: new Date().toISOString() }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // GET /setWebhook
+    if (request.method === "GET" && url.pathname === "/setWebhook") {
+      const botToken = env.BOT_TOKEN;
+      if (!botToken) {
+        return new Response("Error: BOT_TOKEN is not configured in environment variables.", { status: 400 });
+      }
+      const workerUrl = `${url.protocol}//${url.host}/webhook`;
+      const tgUrl = `https://api.telegram.org/bot${botToken}/setWebhook?url=${encodeURIComponent(workerUrl)}`;
+      
+      try {
+        const res = await fetch(tgUrl);
+        const data = await res.json();
+        return new Response(JSON.stringify({ message: "Webhook registration attempt", telegramResponse: data }), {
+          headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(`Error registering webhook: ${err.message}`, { status: 500 });
+      }
+    }
+
+    // POST /webhook
+    if (request.method === "POST" && (url.pathname === "/webhook" || url.pathname === "/")) {
+      try {
+        const update = await request.json();
+        ctx.waitUntil(handleTelegramUpdate(update, env));
+        return new Response("OK", { status: 200 });
+      } catch (err) {
+        console.error("Webhook processing error:", err);
+        return new Response("Error processing update", { status: 500 });
+      }
+    }
+
+    return new Response("Telegram Bot Worker running! Use /setWebhook to register your worker URL.", { status: 200 });
+  },
+
+  async scheduled(event, env, ctx) {
+    // Cron trigger running every minute to process scheduled posts
+    ctx.waitUntil(processScheduledPosts(env));
+  }
+};
+
+/**
+ * TELEGRAM API UTILS
+ */
+async function callTelegram(env, method, body) {
+  const token = env.BOT_TOKEN;
+  if (!token) throw new Error("BOT_TOKEN is missing!");
+  
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+// Global helper to send messages
+async function sendMessage(env, chatId, text, options = {}) {
+  return callTelegram(env, "sendMessage", {
+    chat_id: chatId,
+    text: text,
+    parse_mode: "HTML",
+    ...options
+  });
+}
+
+async function answerCallbackQuery(env, callbackQueryId, text = "", showAlert = false) {
+  return callTelegram(env, "answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    text: text,
+    show_alert: showAlert
+  });
+}
+
+/**
+ * PARSERS
+ */
+function parseButtons(text) {
+  const keyboard = [];
+  let currentRow = [];
+  const lines = text.split("\n");
+  for (let line of lines) {
+    line = line.trim();
+    if (!line) continue;
+    if (line === "—" || line === "---" || line === "--") {
+      if (currentRow.length > 0) {
+        keyboard.push(currentRow);
+        currentRow = [];
+      }
+    } else {
+      const parts = line.split("|");
+      if (parts.length >= 2) {
+        const btnText = parts[0].trim();
+        const btnUrl = parts.slice(1).join("|").trim();
+        currentRow.push({ text: btnText, url: btnUrl });
+      }
+    }
+  }
+  if (currentRow.length > 0) {
+    keyboard.push(currentRow);
+  }
+  return keyboard;
+}
+
+function parseDateTimeWithOffset(dateStr, offsetMinutes) {
+  // dateStr format: YYYY-MM-DD HH:mm
+  const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const [_, year, month, day, hour, minute] = match.map(Number);
+  
+  // Create UTC date components
+  const utcDate = Date.UTC(year, month - 1, day, hour, minute);
+  if (isNaN(utcDate)) return null;
+  
+  // Convert local timezone to true UTC timestamp
+  // If offset is +3:30 (+210 mins), we subtract 210 mins to get UTC timestamp
+  return utcDate - offsetMinutes * 60 * 1000;
+}
+
+function formatTimestamp(timestamp, offsetMinutes) {
+  const date = new Date(timestamp + offsetMinutes * 60 * 1000);
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  const h = String(date.getUTCHours()).padStart(2, "0");
+  const min = String(date.getUTCMinutes()).padStart(2, "0");
+  return `${y}/${m}/${d} - ${h}:${min}`;
+}
+
+/**
+ * SEND POST ENGINE
+ */
+async function sendPostToTelegram(env, chatId, post, replyToMessageId = null) {
+  let method = "sendMessage";
+  let body = { chat_id: chatId };
+
+  if (replyToMessageId) {
+    body.reply_to_message_id = replyToMessageId;
+  }
+
+  // Set keyboard
+  if (post.buttons && post.buttons.length > 0) {
+    body.reply_markup = { inline_keyboard: post.buttons };
+  }
+
+  const isAbove = post.captionPosition === "above";
+
+  if (post.contentType === "text") {
+    method = "sendMessage";
+    body.text = post.text;
+    body.parse_mode = "HTML";
+  } else {
+    const fileId = post.fileId;
+    const caption = post.text; // Text captured is stored under .text
+
+    if (post.contentType === "photo") {
+      method = "sendPhoto";
+      body.photo = fileId;
+    } else if (post.contentType === "video") {
+      method = "sendVideo";
+      body.video = fileId;
+    } else if (post.contentType === "gif") {
+      method = "sendAnimation";
+      body.animation = fileId;
+    } else if (post.contentType === "audio") {
+      method = "sendAudio";
+      body.audio = fileId;
+    } else if (post.contentType === "document") {
+      method = "sendDocument";
+      body.document = fileId;
+    } else if (post.contentType === "sticker") {
+      method = "sendSticker";
+      body.sticker = fileId;
+    } else if (post.contentType === "voice") {
+      method = "sendVoice";
+      body.voice = fileId;
+    }
+
+    if (caption) {
+      if (isAbove) {
+        // Send caption first
+        const capBody = {
+          chat_id: chatId,
+          text: caption,
+          parse_mode: "HTML"
+        };
+        if (replyToMessageId) {
+          capBody.reply_to_message_id = replyToMessageId;
+        }
+        const capRes = await callTelegram(env, "sendMessage", capBody);
+        if (capRes.ok && capRes.result) {
+          body.reply_to_message_id = capRes.result.message_id;
+        }
+      } else {
+        body.caption = caption;
+        body.parse_mode = "HTML";
+      }
+    }
+  }
+
+  const result = await callTelegram(env, method, body);
+  
+  // If reply post exists, send it
+  if (result.ok && result.result && post.replyPost) {
+    const firstMsgId = result.result.message_id;
+    await sendPostToTelegram(env, chatId, post.replyPost, firstMsgId);
+  }
+
+  return result;
+}
+
+/**
+ * TELEGRAM UPDATE HANDLER
+ */
+async function handleTelegramUpdate(update, env) {
+  // Extract user info
+  let user = null;
+  let isCallback = false;
+  let callbackQueryId = null;
+  let callbackData = null;
+  let message = null;
+
+  if (update.callback_query) {
+    user = update.callback_query.from;
+    isCallback = true;
+    callbackQueryId = update.callback_query.id;
+    callbackData = update.callback_query.data;
+    message = update.callback_query.message;
+  } else if (update.message) {
+    user = update.message.from;
+    message = update.message;
+  }
+
+  if (!user) return;
+
+  // Authorization Check
+  const adminsVar = env.ADMIN_IDS || "";
+  const adminIds = adminsVar.split(",").map(id => id.trim()).filter(id => id);
+  if (!adminIds.includes(String(user.id))) {
+    const unauthorizedText = "⛔ شما دسترسی به این ربات ندارید. لطفاً برای ثبت آی‌دی خود به متغیرهای محیطی در کلودفلر مراجعه کنید.";
+    if (isCallback) {
+      await answerCallbackQuery(env, callbackQueryId, "دسترسی غیرمجاز", true);
+    } else {
+      await callTelegram(env, "sendMessage", { chat_id: message.chat.id, text: unauthorizedText });
+    }
+    return;
+  }
+
+  const kv = env.BOT_KV;
+  if (!kv) {
+    const errorText = "⚠️ خطای پیکربندی: KV Namespace با نام BOT_KV متصل نشده است.";
+    if (!isCallback) {
+      await callTelegram(env, "sendMessage", { chat_id: message.chat.id, text: errorText });
+    }
+    return;
+  }
+
+  // Load state and draft
+  const stateKey = `state:${user.id}`;
+  const draftKey = `draft:${user.id}`;
+  
+  let state = await kv.get(stateKey, { type: "json" }) || { step: "MAIN_MENU" };
+  let draft = await kv.get(draftKey, { type: "json" }) || {};
+
+  try {
+    if (isCallback) {
+      await answerCallbackQuery(env, callbackQueryId);
+      await handleCallback(callbackData, user, state, draft, message, env);
+    } else {
+      await handleMessage(message, user, state, draft, env);
+    }
+  } catch (err) {
+    console.error("Error handling update:", err);
+    // Reset state on error to prevent being locked
+    await kv.put(stateKey, JSON.stringify({ step: "MAIN_MENU" }));
+    await kv.delete(draftKey);
+    await sendMessage(env, message.chat.id, `⚠️ خطایی رخ داد: ${err.message || err}\nبه منوی اصلی بازگردانده شدید.`, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🏠 منوی اصلی", callback_data: "menu_main" }]]
+      }
+    });
+  }
+}
+
+/**
+ * CALLBACK ROUTER
+ */
+async function handleCallback(data, user, state, draft, message, env) {
+  const kv = env.BOT_KV;
+  const chatId = message.chat.id;
+  const msgId = message.message_id;
+
+  // Global back or menu triggers
+  if (data === "menu_main") {
+    state.step = "MAIN_MENU";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    await showMainMenu(env, chatId, msgId);
+    return;
+  }
+
+  if (data === "menu_channels") {
+    state.step = "CHANNELS_LIST";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    await showChannelsList(env, chatId, msgId);
+    return;
+  }
+
+  if (data === "add_channel_start") {
+    state.step = "AWAITING_CHANNEL_FORWARD";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    const text = "➕ <b>افزودن کانال جدید</b>\n\nلطفاً یک پیام از کانال مورد نظر را به این ربات <b>فوردارد (هدایت)</b> کنید یا آیدی عمومی کانال را با @ ارسال کنید:\n\n<i>مثال: @my_channel</i>";
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: "menu_channels" }]]
+      }
+    });
+    return;
+  }
+
+  if (data === "menu_scheduled") {
+    await showScheduledPosts(env, chatId, msgId, null);
+    return;
+  }
+
+  if (data === "menu_settings") {
+    await showSettings(env, chatId, msgId);
+    return;
+  }
+
+  if (data.startsWith("settings_tz_")) {
+    const tz = data.replace("settings_tz_", "");
+    let offset = 0;
+    let label = "UTC";
+    if (tz === "tehran") { offset = 210; label = "Tehran (UTC+3:30)"; }
+    else if (tz === "dubai") { offset = 240; label = "Dubai (UTC+4)"; }
+    else if (tz === "utc") { offset = 0; label = "UTC"; }
+
+    let settings = await kv.get("settings", { type: "json" }) || {};
+    settings.timezone = tz;
+    settings.timezoneOffset = offset;
+    settings.timezoneLabel = label;
+    await kv.put("settings", JSON.stringify(settings));
+
+    await callTelegram(env, "answerCallbackQuery", {
+      callback_query_id: data,
+      text: `منطقه زمانی به ${label} تغییر یافت`,
+      show_alert: true
+    });
+    await showSettings(env, chatId, msgId);
+    return;
+  }
+
+  if (data === "settings_tz_custom_start") {
+    state.step = "AWAITING_SETTINGS_TZ_CUSTOM";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    const text = "🕐 <b>تنظیم دستی منطقه زمانی</b>\n\nلطفاً اختلاف زمانی با UTC را به دقیقه وارد کنید.\n\n<i>مثال برای ایران در نیمه اول سال: 270\nنیمه دوم سال: 210</i>";
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: "menu_settings" }]]
+      }
+    });
+    return;
+  }
+
+  if (data === "settings_test_channel_start") {
+    state.step = "AWAITING_SETTINGS_TEST_CHANNEL";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    const text = "📲 <b>تنظیم آیدی کانال تست</b>\n\nلطفاً آیدی عددی کانال تست خود را وارد کنید (شروع با -100):\n\n<i>مثال: -100123456789</i>";
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: "menu_settings" }]]
+      }
+    });
+    return;
+  }
+
+  // View specific channel
+  if (data.startsWith("chan_view:")) {
+    const chanId = data.replace("chan_view:", "");
+    await showChannelMenu(env, chatId, msgId, chanId);
+    return;
+  }
+
+  // Delete channel
+  if (data.startsWith("chan_delete:")) {
+    const chanId = data.replace("chan_delete:", "");
+    let channels = await kv.get("channels", { type: "json" }) || [];
+    channels = channels.filter(c => c.id !== chanId);
+    await kv.put("channels", JSON.stringify(channels));
+
+    await callTelegram(env, "answerCallbackQuery", { callback_query_id: data, text: "🗑️ کانال حذف شد" });
+    await showChannelsList(env, chatId, msgId);
+    return;
+  }
+
+  // Post flow start
+  if (data.startsWith("post_create:")) {
+    const chanId = data.replace("post_create:", "");
+    let channels = await kv.get("channels", { type: "json" }) || [];
+    const targetChan = channels.find(c => c.id === chanId);
+    
+    state.step = "AWAITING_CONTENT_TYPE";
+    state.targetChannelId = chanId;
+    state.targetChannelName = targetChan ? targetChan.name : "نامشخص";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    // Initialize clean draft
+    draft = {
+      contentType: "text",
+      fileId: null,
+      text: "",
+      captionPosition: "below",
+      buttons: [],
+      replyPost: null,
+      scheduleAt: null
+    };
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    await askContentType(env, chatId, msgId, state.targetChannelName);
+    return;
+  }
+
+  // Select content type
+  if (data.startsWith("post_type:")) {
+    const type = data.replace("post_type:", "");
+    draft.contentType = type;
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    state.step = "AWAITING_CONTENT";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    let typePersian = "";
+    if (type === "text") typePersian = "متن";
+    else if (type === "photo") typePersian = "عکس";
+    else if (type === "video") typePersian = "ویدیو";
+    else if (type === "gif") typePersian = "گیف";
+    else if (type === "audio") typePersian = "فایل صوتی";
+    else if (type === "document") typePersian = "فایل / داکیومنت";
+    else if (type === "sticker") typePersian = "استیکر";
+    else if (type === "voice") typePersian = "ویس (صدای ضبط شده)";
+
+    const text = `✍️ <b>ارسال محتوای پست (${typePersian})</b>\n\nلطفاً پیام خود را به عنوان محتوای پست ارسال کنید.\nمیتوانید از فرمتبندی استاندارد HTML تلگرام استفاده کنید:\n\n- <code>&lt;b&gt;bold&lt;/b&gt;</code>\n- <code>&lt;i&gt;italic&lt;/i&gt;</code>\n- <code>&lt;u&gt;underline&lt;/u&gt;</code>\n- <code>&lt;s&gt;strikethrough&lt;/s&gt;</code>\n- <code>&lt;a href=\"URL\"&gt;link&lt;/a&gt;</code>`;
+    
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: `chan_view:${state.targetChannelId}` }]]
+      }
+    });
+    return;
+  }
+
+  // Caption Position buttons
+  if (data.startsWith("post_caption_pos:")) {
+    const pos = data.replace("post_caption_pos:", "");
+    draft.captionPosition = pos;
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    // Next step is Inline Buttons decision
+    await askInlineButtonsChoice(env, chatId, msgId);
+    return;
+  }
+
+  // Inline Buttons decision
+  if (data === "post_btn_yes") {
+    state.step = "AWAITING_BUTTONS_TEXT";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    const text = "🔗 <b>تنظیم دکمههای شیشهای</b>\n\nلطفاً دکمهها را در قالب متنی زیر ارسال کنید:\n\n<code>خرید اشتراک | https://example.com\nوبسایت | https://site.com\n—\nپشتیبانی | https://t.me/support</code>\n\n• علامت <code>|</code> نام دکمه را از لینک جدا میکند.\n• علامت <code>—</code> یا <code>---</code> در خط مجزا، یک ردیف جدید ایجاد میکند.";
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "❌ منصرف شدم / بدون دکمه", callback_data: "post_btn_no" }]]
+      }
+    });
+    return;
+  }
+
+  if (data === "post_btn_no") {
+    draft.buttons = [];
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+    await askReplyChoice(env, chatId, msgId);
+    return;
+  }
+
+  // Confirm inline buttons
+  if (data === "post_btn_confirm") {
+    await askReplyChoice(env, chatId, msgId);
+    return;
+  }
+
+  if (data === "post_btn_reedit") {
+    state.step = "AWAITING_BUTTONS_TEXT";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    const text = "🔗 دکمههای جدید را طبق همان الگو مجدداً ارسال کنید:";
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "❌ لغو دکمهها", callback_data: "post_btn_no" }]]
+      }
+    });
+    return;
+  }
+
+  // Reply Choice buttons
+  if (data === "post_reply_yes") {
+    // We must transition current draft into a replyPost mode.
+    // We save the parent draft in draft.parentDraft state, then we initialize replyPost
+    const parentDraft = { ...draft };
+    
+    state.step = "AWAITING_REPLY_CONTENT_TYPE";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    // Reset draft as reply content type select
+    draft = {
+      isReply: true,
+      parentDraft: parentDraft,
+      contentType: "text",
+      fileId: null,
+      text: "",
+      captionPosition: "below",
+      buttons: [],
+      replyPost: null,
+      scheduleAt: null
+    };
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    await askContentType(env, chatId, msgId, `${state.targetChannelName} (پیام پاسخ)`);
+    return;
+  }
+
+  if (data === "post_reply_no") {
+    // Move to test channel preview
+    await prepareTestChannelPreview(env, user, state, draft, chatId, msgId);
+    return;
+  }
+
+  // Test Channel actions
+  if (data === "post_test_confirm") {
+    await showSendOptions(env, chatId, msgId);
+    return;
+  }
+
+  if (data === "post_test_edit") {
+    // Go back to type selection or reset
+    state.step = "AWAITING_CONTENT_TYPE";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    await askContentType(env, chatId, msgId, state.targetChannelName);
+    return;
+  }
+
+  if (data === "post_test_cancel") {
+    await kv.delete(`draft:${user.id}`);
+    state.step = "MAIN_MENU";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    await sendMessage(env, chatId, "❌ ایجاد پست لغو شد.", {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🏠 منوی اصلی", callback_data: "menu_main" }]]
+      }
+    });
+    return;
+  }
+
+  // Send Actions
+  if (data === "post_send_now") {
+    await sendMessage(env, chatId, "🚀 در حال ارسال پست به کانال اصلی...");
+    
+    const targetChatId = state.targetChannelId;
+    const res = await sendPostToTelegram(env, targetChatId, draft);
+    
+    if (res.ok) {
+      await kv.delete(`draft:${user.id}`);
+      state.step = "MAIN_MENU";
+      await kv.put(`state:${user.id}`, JSON.stringify(state));
+      await sendMessage(env, chatId, "✅ <b>پست با موفقیت در کانال منتشر شد!</b>", {
+        reply_markup: {
+          inline_keyboard: [[{ text: "🏠 بازگشت به منوی اصلی", callback_data: "menu_main" }]]
+        }
+      });
+    } else {
+      await sendMessage(env, chatId, `⚠️ خطایی در ارسال مستقیم رخ داد:\n${res.description || "نامشخص"}`, {
+        reply_markup: {
+          inline_keyboard: [[{ text: "🏠 منوی اصلی", callback_data: "menu_main" }]]
+        }
+      });
+    }
+    return;
+  }
+
+  if (data === "post_send_schedule") {
+    state.step = "AWAITING_SCHEDULE_TIME";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    const text = "⏱️ <b>زمانبندی ارسال پست</b>\n\nلطفاً تاریخ و زمان ارسال را به فرمت میلادی زیر ارسال کنید:\n\n<code>YYYY-MM-DD HH:mm</code>\n\n<i>مثال: 2025-08-15 14:30</i>";
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: "post_test_confirm" }]]
+      }
+    });
+    return;
+  }
+
+  if (data.startsWith("post_tz_select:")) {
+    const tz = data.replace("post_tz_select:", "");
+    let offset = 0;
+    if (tz === "tehran") offset = 210;
+    else if (tz === "dubai") offset = 240;
+    else if (tz === "utc") offset = 0;
+
+    const timestamp = parseDateTimeWithOffset(draft.tempScheduleTime, offset);
+    if (!timestamp) {
+      await sendMessage(env, chatId, "⚠️ خطا در پردازش تاریخ و زمان. لطفاً دوباره وارد کنید:");
+      state.step = "AWAITING_SCHEDULE_TIME";
+      await kv.put(`state:${user.id}`, JSON.stringify(state));
+      return;
+    }
+
+    draft.scheduleAt = timestamp;
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    // Show Confirmation
+    const formatLabel = formatTimestamp(timestamp, offset);
+    const text = `📋 <b>تایید زمانبندی پست</b>\n\n📍 کانال مقصد: <b>${state.targetChannelName}</b>\n⏰ زمان ارسال: <b>${formatLabel}</b>\n🌐 ریجن: <b>${tz.toUpperCase()}</b>\n\nآیا این زمانبندی را تایید میکنید؟`;
+    
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ تایید و ذخیره زمانبندی", callback_data: `post_schedule_save:${tz}` },
+            { text: "✏️ تغییر زمان", callback_data: "post_send_schedule" }
+          ],
+          [{ text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }]
+        ]
+      }
+    });
+    return;
+  }
+
+  if (data.startsWith("post_schedule_save:")) {
+    const tz = data.replace("post_schedule_save:", "");
+    // Save to scheduled posts
+    const postId = "post_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+    
+    const schedObj = {
+      id: postId,
+      targetChannelId: state.targetChannelId,
+      targetChannelName: state.targetChannelName,
+      post: draft,
+      scheduleAt: draft.scheduleAt,
+      timezone: tz
+    };
+
+    await kv.put(`scheduled:${postId}`, JSON.stringify(schedObj));
+
+    // Update scheduled list
+    let index = await kv.get("scheduled_index", { type: "json" }) || [];
+    index.push(postId);
+    await kv.put("scheduled_index", JSON.stringify(index));
+
+    // Done
+    await kv.delete(`draft:${user.id}`);
+    state.step = "MAIN_MENU";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    await sendMessage(env, chatId, "🎉 <b>پست شما با موفقیت زمانبندی شد!</b>\nدر زمان مشخص شده به صورت خودکار ارسال خواهد شد.", {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🏠 بازگشت به منوی اصلی", callback_data: "menu_main" }]]
+      }
+    });
+    return;
+  }
+
+  // Scheduled viewer operations
+  if (data.startsWith("sched_view:")) {
+    const postId = data.replace("sched_view:", "");
+    await showScheduledPostDetail(env, chatId, msgId, postId);
+    return;
+  }
+
+  if (data.startsWith("sched_test_preview:")) {
+    const postId = data.replace("sched_test_preview:", "");
+    const schedObj = await kv.get(`scheduled:${postId}`, { type: "json" });
+    if (!schedObj) {
+      await answerCallbackQuery(env, data, "❌ پست پیدا نشد", true);
+      return;
+    }
+    const settings = await kv.get("settings", { type: "json" }) || {};
+    const testChannelId = settings.testChannelId || env.TEST_CHANNEL_ID;
+    
+    if (!testChannelId) {
+      await sendMessage(env, chatId, "⚠️ کانال تست تنظیم نشده است. لطفاً ابتدا در تنظیمات آیدی کانال تست را ثبت کنید.");
+      return;
+    }
+
+    await sendMessage(env, chatId, "🔄 در حال ارسال پیش‌نمایش به کانال تست...");
+    await sendPostToTelegram(env, testChannelId, schedObj.post);
+    await sendMessage(env, chatId, "✅ پیش‌نمایش ارسال شد. لطفاً کانال تست خود را بررسی کنید.");
+    return;
+  }
+
+  if (data.startsWith("sched_edit_time:")) {
+    const postId = data.replace("sched_edit_time:", "");
+    state.step = "AWAITING_EDIT_SCHEDULE_TIME";
+    state.editingPostId = postId;
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    const text = "✏️ <b>تغییر زمانبندی پست</b>\n\nلطفاً زمان جدید ارسال را به فرمت میلادی ارسال کنید:\n\n<code>YYYY-MM-DD HH:mm</code>\n\n<i>مثال: 2025-08-15 14:30</i>";
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: `sched_view:${postId}` }]]
+      }
+    });
+    return;
+  }
+
+  if (data.startsWith("sched_delete:")) {
+    const postId = data.replace("sched_delete:", "");
+    await kv.delete(`scheduled:${postId}`);
+
+    let index = await kv.get("scheduled_index", { type: "json" }) || [];
+    index = index.filter(id => id !== postId);
+    await kv.put("scheduled_index", JSON.stringify(index));
+
+    await callTelegram(env, "answerCallbackQuery", { callback_query_id: data, text: "🗑️ پست زمانبندی حذف شد" });
+    await showScheduledPosts(env, chatId, msgId, null);
+    return;
+  }
+}
+
+/**
+ * MESSAGE ROUTER
+ */
+async function handleMessage(message, user, state, draft, env) {
+  const kv = env.BOT_KV;
+  const chatId = message.chat.id;
+  const text = message.text ? message.text.trim() : "";
+
+  // Handle global start command
+  if (text === "/start" || text === "منوی اصلی") {
+    state.step = "MAIN_MENU";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    await showMainMenu(env, chatId, null);
+    return;
+  }
+
+  // Handle custom manual input steps
+  if (state.step === "AWAITING_CHANNEL_FORWARD") {
+    let targetChannelId = null;
+    let targetChannelName = "";
+
+    if (message.forward_from_chat && message.forward_from_chat.type === "channel") {
+      targetChannelId = message.forward_from_chat.id;
+      targetChannelName = message.forward_from_chat.title;
+    } else if (text.startsWith("@")) {
+      targetChannelId = text;
+      targetChannelName = text;
+    } else if (text.startsWith("-100")) {
+      targetChannelId = text;
+      targetChannelName = text;
+    }
+
+    if (!targetChannelId) {
+      await sendMessage(env, chatId, "⚠️ پیام فوروارد شده معتبر نیست یا فرمت آیدی صحیح نیست. لطفاً مجدداً تلاش کنید یا بازگردید:", {
+        reply_markup: {
+          inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: "menu_channels" }]]
+        }
+      });
+      return;
+    }
+
+    // Verify bot is admin using getChat
+    const chatRes = await callTelegram(env, "getChat", { chat_id: targetChannelId });
+    if (!chatRes.ok) {
+      await sendMessage(env, chatId, `⚠️ خطا: ربات در کانال ${targetChannelName} عضو نیست یا دسترسی ادمین ندارد.\n\nلطفاً مطمئن شوید ربات را در کانال عضو کرده و دسترسی ادمین (Post Messages) داده‌اید.\nپیام خطای تلگرام:\n<code>${chatRes.description || "یافت نشد"}</code>`, {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🔄 تلاش مجدد", callback_data: "add_channel_start" }],
+            [{ text: "🔙 بازگشت به لیست کانال‌ها", callback_data: "menu_channels" }]
+          ]
+        }
+      });
+      return;
+    }
+
+    // Move to next step: Ask display name
+    state.step = "AWAITING_CHANNEL_NAME";
+    state.tempChannelId = String(chatRes.result.id);
+    state.tempChannelName = chatRes.result.title || targetChannelName;
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    await sendMessage(env, chatId, `✅ ربات عضو کانال "<b>${state.tempChannelName}</b>" شد!\n\nحالا یک نام نمایشی کوتاه و دلخواه برای مدیریت این کانال در ربات بنویسید:\n<i>(این نام فقط به مدیران نمایش داده میشود)</i>`);
+    return;
+  }
+
+  if (state.step === "AWAITING_CHANNEL_NAME") {
+    if (!text) {
+      await sendMessage(env, chatId, "⚠️ نام نمایشی نامعتبر است. لطفاً یک متن وارد کنید:");
+      return;
+    }
+
+    // Add to channels list
+    let channels = await kv.get("channels", { type: "json" }) || [];
+    
+    // Check if channel already exists
+    channels = channels.filter(c => c.id !== state.tempChannelId);
+    
+    channels.push({
+      id: state.tempChannelId,
+      name: text,
+      telegramTitle: state.tempChannelName,
+      addedAt: Date.now()
+    });
+
+    await kv.put("channels", JSON.stringify(channels));
+
+    // Reset state
+    state.step = "MAIN_MENU";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    const keyboard = [
+      [
+        { text: "📢 رفتن به لیست کانال‌ها", callback_data: "menu_channels" },
+        { text: "🏠 منوی اصلی", callback_data: "menu_main" }
+      ]
+    ];
+    await sendMessage(env, chatId, `🎉 کانال <b>${text}</b> با موفقیت به سیستم مدیریت ربات متصل شد!`, {
+      reply_markup: { inline_keyboard: keyboard }
+    });
+    return;
+  }
+
+  if (state.step === "AWAITING_SETTINGS_TEST_CHANNEL") {
+    if (!text.startsWith("-100")) {
+      await sendMessage(env, chatId, "⚠️ آیدی معتبر کانال تلگرام معمولاً با <code>-100</code> شروع میشود. مجددا وارد کنید:");
+      return;
+    }
+
+    let settings = await kv.get("settings", { type: "json" }) || {};
+    settings.testChannelId = text;
+    await kv.put("settings", JSON.stringify(settings));
+
+    state.step = "MAIN_MENU";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    await sendMessage(env, chatId, `✅ آیدی کانال تست با موفقیت به <code>${text}</code> تغییر یافت.`, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "⚙️ بازگشت به تنظیمات", callback_data: "menu_settings" }]]
+      }
+    });
+    return;
+  }
+
+  if (state.step === "AWAITING_SETTINGS_TZ_CUSTOM") {
+    const mins = parseInt(text);
+    if (isNaN(mins)) {
+      await sendMessage(env, chatId, "⚠️ لطفاً عدد صحیح وارد کنید:");
+      return;
+    }
+
+    let settings = await kv.get("settings", { type: "json" }) || {};
+    settings.timezone = "custom";
+    settings.timezoneOffset = mins;
+    settings.timezoneLabel = `دستی (UTC${mins >= 0 ? "+" : ""}${mins / 60})`;
+    await kv.put("settings", JSON.stringify(settings));
+
+    state.step = "MAIN_MENU";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    await sendMessage(env, chatId, `✅ منطقه زمانی با موفقیت به اختلاف ${mins} دقیقه ذخیره شد.`, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "⚙️ بازگشت به تنظیمات", callback_data: "menu_settings" }]]
+      }
+    });
+    return;
+  }
+
+  if (state.step === "AWAITING_CONTENT") {
+    // Collect text & files
+    const type = draft.contentType;
+    let fileId = null;
+    let postText = message.text || message.caption || "";
+
+    // Keep HTML tags if rich formatting exists
+    if (message.entities || message.caption_entities) {
+      // Telegram format is complex, we use raw caption if text has formatting.
+      // In CF Workers, parsing HTML or markdown formatting dynamically from Telegram entities
+      // can be elegantly solved by transforming entity bounds.
+      // But we can fallback to preserving user inputs or using HTML parse mode on message text directly
+      // if they write in HTML tags directly.
+    }
+
+    if (type === "photo" && message.photo) {
+      // Pick highest resolution
+      const photoArray = message.photo;
+      fileId = photoArray[photoArray.length - 1].file_id;
+    } else if (type === "video" && message.video) {
+      fileId = message.video.file_id;
+    } else if (type === "gif" && message.document && message.document.mime_type === "video/mp4") {
+      fileId = message.document.file_id;
+    } else if (type === "gif" && message.animation) {
+      fileId = message.animation.file_id;
+    } else if (type === "audio" && message.audio) {
+      fileId = message.audio.file_id;
+    } else if (type === "document" && message.document) {
+      fileId = message.document.file_id;
+    } else if (type === "sticker" && message.sticker) {
+      fileId = message.sticker.file_id;
+    } else if (type === "voice" && message.voice) {
+      fileId = message.voice.file_id;
+    }
+
+    // Fallback if they sent incorrect file type
+    if (type !== "text" && !fileId) {
+      await sendMessage(env, chatId, `⚠️ محتوای ارسالی با قالب انتخابی (${type}) مطابقت ندارد. لطفاً فایل مناسب را ارسال کنید:`);
+      return;
+    }
+
+    // Write to draft
+    draft.fileId = fileId;
+    draft.text = postText;
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    // Determine next step
+    if (type === "text") {
+      // Skip caption position, ask buttons
+      await askInlineButtonsChoice(env, chatId, null);
+    } else {
+      // Ask Caption Position
+      state.step = "AWAITING_CAPTION_POSITION";
+      await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+      const text = "📐 <b>محل قرارگیری کپشن (متن)</b>\n\nآیا میخواهید متن بالای تصویر/ویدیو به صورت یک پیام مستقل ارسال شود، یا کپشن زیر تصویر/ویدیو متصل باشد؟";
+      const keyboard = [
+        [
+          { text: "⬆️ متن بالای تصویر/ویدیو", callback_data: "post_caption_pos:above" },
+          { text: "⬇️ کپشن زیر تصویر/ویدیو", callback_data: "post_caption_pos:below" }
+        ],
+        [{ text: "🔙 بازگشت", callback_data: "menu_main" }]
+      ];
+      await sendMessage(env, chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+    }
+    return;
+  }
+
+  if (state.step === "AWAITING_BUTTONS_TEXT") {
+    const keyboard = parseButtons(text);
+    if (keyboard.length === 0) {
+      await sendMessage(env, chatId, "⚠️ فرمت دکمه‌ها صحیح نیست. لطفاً مجدداً مطابق نمونه ارسال کنید:");
+      return;
+    }
+
+    draft.buttons = keyboard;
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    // Confirm buttons visually
+    const confirmText = "👀 <b>پیش‌نمایش دکمه‌های شیشه‌ای شما:</b>\n\nدکمه‌ها با لینک‌های مربوطه به پست اضافه شدند. آیا مایلید ذخیره شوند؟";
+    await sendMessage(env, chatId, confirmText, {
+      reply_markup: {
+        inline_keyboard: [
+          ...keyboard,
+          [
+            { text: "✅ تایید دکمه‌ها", callback_data: "post_btn_confirm" },
+            { text: "✏️ ویرایش مجدد", callback_data: "post_btn_reedit" }
+          ]
+        ]
+      }
+    });
+    return;
+  }
+
+  if (state.step === "AWAITING_SCHEDULE_TIME") {
+    // Validate format YYYY-MM-DD HH:mm
+    const match = text.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/);
+    if (!match) {
+      await sendMessage(env, chatId, "⚠️ فرمت وارد شده نامعتبر است. نمونه: <code>2025-08-15 14:30</code>");
+      return;
+    }
+
+    draft.tempScheduleTime = text;
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    // Ask timezone
+    const textTz = "🌐 <b>انتخاب منطقه زمانی (Timezone)</b>\n\nلطفاً منطقه زمانی تاریخ ثبت شده را انتخاب کنید:";
+    const keyboard = [
+      [
+        { text: "🇮🇷 تهران UTC+3:30", callback_data: "post_tz_select:tehran" },
+        { text: "🌍 UTC / گرینویچ", callback_data: "post_tz_select:utc" },
+        { text: "🇦🇪 دبی UTC+4", callback_data: "post_tz_select:dubai" }
+      ],
+      [{ text: "🔙 بازگشت", callback_data: "post_test_confirm" }]
+    ];
+    await sendMessage(env, chatId, textTz, { reply_markup: { inline_keyboard: keyboard } });
+    return;
+  }
+
+  if (state.step === "AWAITING_EDIT_SCHEDULE_TIME") {
+    const match = text.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/);
+    if (!match) {
+      await sendMessage(env, chatId, "⚠️ فرمت نامعتبر است. نمونه: <code>2025-08-15 14:30</code>");
+      return;
+    }
+
+    const postId = state.editingPostId;
+    const schedObj = await kv.get(`scheduled:${postId}`, { type: "json" });
+    if (!schedObj) {
+      await sendMessage(env, chatId, "⚠️ پست زمانبندی شده یافت نشد.");
+      return;
+    }
+
+    // Get current timezone setting
+    const settings = await kv.get("settings", { type: "json" }) || {};
+    const offset = settings.timezoneOffset || 0;
+
+    const timestamp = parseDateTimeWithOffset(text, offset);
+    if (!timestamp) {
+      await sendMessage(env, chatId, "⚠️ مقدار زمان نامعتبر است.");
+      return;
+    }
+
+    schedObj.scheduleAt = timestamp;
+    await kv.put(`scheduled:${postId}`, JSON.stringify(schedObj));
+
+    state.step = "MAIN_MENU";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    await sendMessage(env, chatId, `✅ زمان ارسال پست با موفقیت به <b>${formatTimestamp(timestamp, offset)}</b> تغییر یافت.`, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🏠 بازگشت به منوی اصلی", callback_data: "menu_main" }]]
+      }
+    });
+    return;
+  }
+
+  // Fallback
+  await showMainMenu(env, chatId, null);
+}
+
+/**
+ * UI SCREEN HELPERS
+ */
+async function showMainMenu(env, chatId, editMsgId) {
+  const text = "<b>👋 به ربات پیشرفته مدیریت کانال خوش آمدید!</b>\n\nبا استفاده از این ربات قدرتمند، میتوانید محتواهای خود را ویرایش کرده، دکمههای شیشهای متصل کرده و آنها را برای ارسال خودکار زمانبندی کنید.";
+  const keyboard = [
+    [
+      { text: "📢 کانالهای من", callback_data: "menu_channels" },
+      { text: "➕ افزودن کانال جدید", callback_data: "add_channel_start" }
+    ],
+    [
+      { text: "📋 پستهای زمانبندی شده", callback_data: "menu_scheduled" },
+      { text: "⚙️ تنظیمات ربات", callback_data: "menu_settings" }
+    ]
+  ];
+
+  if (editMsgId) {
+    await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+  } else {
+    await sendMessage(env, chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+  }
+}
+
+async function showChannelsList(env, chatId, editMsgId) {
+  const kv = env.BOT_KV;
+  const channels = await kv.get("channels", { type: "json" }) || [];
+
+  let text = "<b>📢 لیست کانالهای متصل شده:</b>\n\nبرای مدیریت هر کانال و ثبت پست جدید، روی دکمه مربوطه کلیک کنید:";
+  if (channels.length === 0) {
+    text += "\n\n<i>هیچ کانالی یافت نشد! لطفاً کانال خود را اضافه کنید.</i>";
+  }
+
+  const keyboard = [];
+  for (const c of channels) {
+    keyboard.push([{ text: `📣 ${c.name}`, callback_data: `chan_view:${c.id}` }]);
+  }
+  
+  keyboard.push([{ text: "➕ افزودن کانال جدید", callback_data: "add_channel_start" }]);
+  keyboard.push([{ text: "🏠 بازگشت به منوی اصلی", callback_data: "menu_main" }]);
+
+  await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+}
+
+async function showChannelMenu(env, chatId, editMsgId, chanId) {
+  const kv = env.BOT_KV;
+  const channels = await kv.get("channels", { type: "json" }) || [];
+  const chan = channels.find(c => c.id === chanId);
+
+  if (!chan) {
+    await editMessage(env, chatId, editMsgId, "⚠️ کانال یافت نشد.", {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: "menu_channels" }]]
+      }
+    });
+    return;
+  }
+
+  const text = `📣 <b>مدیریت کانال: ${chan.name}</b>\n\nتایتل تلگرام: <code>${chan.telegramTitle}</code>\nآیدی عددی: <code>${chan.id}</code>\n\nلطفاً عملیات مورد نظر را انتخاب کنید:`;
+  const keyboard = [
+    [
+      { text: "✍️ ایجاد پست جدید", callback_data: `post_create:${chan.id}` },
+      { text: "📋 پست‌های زمانبندی شده این کانال", callback_data: `menu_scheduled:${chan.id}` }
+    ],
+    [
+      { text: "🗑️ حذف اتصال کانال", callback_data: `chan_delete:${chan.id}` },
+      { text: "🔙 بازگشت به لیست کانال‌ها", callback_data: "menu_channels" }
+    ]
+  ];
+
+  await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+}
+
+async function askContentType(env, chatId, editMsgId, title) {
+  const text = `🛠️ <b>انتخاب نوع محتوای پست برای [ ${title} ]</b>\n\nلطفاً مشخص کنید قصد دارید چه نوع محتوایی ارسال کنید:`;
+  const keyboard = [
+    [
+      { text: "📝 فقط متن", callback_data: "post_type:text" },
+      { text: "🖼️ عکس + کپشن", callback_data: "post_type:photo" }
+    ],
+    [
+      { text: "🎥 ویدیو + کپشن", callback_data: "post_type:video" },
+      { text: "🎞️ گیف / انیمیشن", callback_data: "post_type:gif" }
+    ],
+    [
+      { text: "🎵 فایل صوتی", callback_data: "post_type:audio" },
+      { text: "📄 فایل / سند", callback_data: "post_type:document" }
+    ],
+    [
+      { text: "🖼️ استیکر", callback_data: "post_type:sticker" },
+      { text: "🎤 ویس ضبط شده", callback_data: "post_type:voice" }
+    ],
+    [{ text: "🔙 بازگشت به منوی اصلی", callback_data: "menu_main" }]
+  ];
+
+  await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+}
+
+async function askInlineButtonsChoice(env, chatId, optionalMsgId) {
+  const text = "🔗 <b>دکمه‌های شیشه‌ای (Inline Buttons)</b>\n\nآیا مایلید دکمه‌های شیشه‌ای دارای لینک به این پست اضافه شوند؟";
+  const keyboard = [
+    [
+      { text: "✅ بله، دکمه اضافه کنم", callback_data: "post_btn_yes" },
+      { text: "❌ خیر، بدون دکمه", callback_data: "post_btn_no" }
+    ]
+  ];
+
+  if (optionalMsgId) {
+    await editMessage(env, chatId, optionalMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+  } else {
+    await sendMessage(env, chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+  }
+}
+
+async function askReplyChoice(env, chatId, editMsgId) {
+  const text = "💬 <b>افزودن پیام پاسخ (Reply Post)</b>\n\nآیا مایلید یک پیام پاسخ ثانویه به این پست زنجیره کنید؟\n<i>(پیام پاسخ به عنوان Reply به پیام اول زیر آن ارسال خواهد شد)</i>";
+  const keyboard = [
+    [
+      { text: "✅ بله، پیام پاسخ اضافه کنم", callback_data: "post_reply_yes" },
+      { text: "❌ خیر", callback_data: "post_reply_no" }
+    ],
+    [{ text: "🔙 بازگشت", callback_data: "menu_main" }]
+  ];
+  await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+}
+
+async function prepareTestChannelPreview(env, user, state, draft, chatId, editMsgId) {
+  const kv = env.BOT_KV;
+
+  // If this was a sub-draft (reply post creation flow)
+  if (draft.isReply && draft.parentDraft) {
+    const parent = draft.parentDraft;
+    // Embed the current draft inside parent draft
+    parent.replyPost = {
+      contentType: draft.contentType,
+      fileId: draft.fileId,
+      text: draft.text,
+      captionPosition: draft.captionPosition,
+      buttons: draft.buttons
+    };
+    // Make parent standard
+    draft = parent;
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+  }
+
+  // Send to test channel ID
+  const settings = await kv.get("settings", { type: "json" }) || {};
+  const testChannelId = settings.testChannelId || env.TEST_CHANNEL_ID;
+
+  if (!testChannelId) {
+    await sendMessage(env, chatId, "⚠️ آیدی کانال تست تنظیم نشده است. لطفاً ابتدا در منوی تنظیمات کانال تست خود را ثبت کنید تا پیش‌نمایش به آن ارسال شود.");
+    await showSendOptions(env, chatId, null);
+    return;
+  }
+
+  await sendMessage(env, chatId, "🔄 در حال ارسال پیش‌نمایش پست به کانال تست...");
+  const previewRes = await sendPostToTelegram(env, testChannelId, draft);
+
+  if (previewRes.ok) {
+    const text = "📲 <b>پیش‌نمایش در کانال تست منتشر شد!</b>\n\nلطفاً پست ارسال شده در کانال تست را به دقت مشاهده کنید و در صورت تایید یکی از گزینه‌های زیر را بزنید:";
+    const keyboard = [
+      [
+        { text: "✅ تایید و ادامه", callback_data: "post_test_confirm" },
+        { text: "✏️ ویرایش مجدد پست", callback_data: "post_test_edit" }
+      ],
+      [{ text: "❌ لغو و حذف کل پیش‌نویس", callback_data: "post_test_cancel" }]
+    ];
+    await sendMessage(env, chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+  } else {
+    await sendMessage(env, chatId, `⚠️ خطا در ارسال پیش‌نمایش به کانال تست:\n<code>${previewRes.description || "نامشخص"}</code>\n\nولی میتوانید مستقیما به مرحله بعد بروید:`, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "✅ تایید و ادامه بدون پیش‌نمایش", callback_data: "post_test_confirm" }],
+          [{ text: "❌ لغو پیش‌نویس", callback_data: "post_test_cancel" }]
+        ]
+      }
+    });
+  }
+}
+
+async function showSendOptions(env, chatId, editMsgId) {
+  const text = "📤 <b>گزینه‌های انتشار پست</b>\n\nآیا مایلید پست هم اکنون منتشر شود یا برای آینده زمانبندی گردد؟";
+  const keyboard = [
+    [
+      { text: "🚀 ارسال همین الان به کانال", callback_data: "post_send_now" },
+      { text: "⏱️ زمانبندی ارسال خودکار", callback_data: "post_send_schedule" }
+    ],
+    [{ text: "🏠 منوی اصلی", callback_data: "menu_main" }]
+  ];
+  if (editMsgId) {
+    await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+  } else {
+    await sendMessage(env, chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+  }
+}
+
+async function showScheduledPosts(env, chatId, editMsgId, filterChanId) {
+  const kv = env.BOT_KV;
+  const index = await kv.get("scheduled_index", { type: "json" }) || [];
+  const settings = await kv.get("settings", { type: "json" }) || {};
+  const offset = settings.timezoneOffset || 0;
+
+  const list = [];
+  for (const id of index) {
+    const p = await kv.get(`scheduled:${id}`, { type: "json" });
+    if (p) {
+      if (!filterChanId || p.targetChannelId === filterChanId) {
+        list.push(p);
+      }
+    }
+  }
+
+  // Sort by date
+  list.sort((a, b) => a.scheduleAt - b.scheduleAt);
+
+  let text = "<b>📋 لیست پست‌های زمانبندی شده:</b>\n\nبرای مشاهده جزییات یا حذف هر پست، کلیک کنید:";
+  if (list.length === 0) {
+    text += "\n\n<i>هیچ پست زمانبندی شده‌ای یافت نشد.</i>";
+  }
+
+  const keyboard = [];
+  for (const p of list) {
+    const formattedTime = formatTimestamp(p.scheduleAt, offset);
+    const label = `📅 ${formattedTime} | ${p.targetChannelName} | نوع: ${p.post.contentType}`;
+    keyboard.push([{ text: label, callback_data: `sched_view:${p.id}` }]);
+  }
+
+  keyboard.push([{ text: "🏠 منوی اصلی", callback_data: "menu_main" }]);
+
+  await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+}
+
+async function showScheduledPostDetail(env, chatId, editMsgId, postId) {
+  const kv = env.BOT_KV;
+  const p = await kv.get(`scheduled:${postId}`, { type: "json" });
+  if (!p) {
+    await editMessage(env, chatId, editMsgId, "⚠️ پست یافت نشد.", {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 بازگشت به لیست", callback_data: "menu_scheduled" }]]
+      }
+    });
+    return;
+  }
+
+  const settings = await kv.get("settings", { type: "json" }) || {};
+  const offset = settings.timezoneOffset || 0;
+  const formattedTime = formatTimestamp(p.scheduleAt, offset);
+
+  const text = `📋 <b>جزییات پست زمانبندی شده</b>\n\n📍 کانال مقصد: <b>${p.targetChannelName}</b>\n⏰ زمان ارسال: <b>${formattedTime}</b>\n📝 نوع محتوا: <b>${p.post.contentType}</b>\n💬 متن: <code>${p.post.text || "(ندارد)"}</code>\n🔗 تعداد دکمه‌ها: <b>${p.post.buttons ? p.post.buttons.flat().length : 0}</b>\n💬 پیام پاسخ ثانویه: <b>${p.post.replyPost ? "دارد" : "ندارد"}</b>`;
+
+  const keyboard = [
+    [
+      { text: "👁️ پیش‌نمایش مجدد در کانال تست", callback_data: `sched_test_preview:${p.id}` },
+      { text: "✏️ ویرایش زمان ارسال", callback_data: `sched_edit_time:${p.id}` }
+    ],
+    [
+      { text: "🗑️ حذف این پست", callback_data: `sched_delete:${p.id}` },
+      { text: "🔙 بازگشت به لیست", callback_data: "menu_scheduled" }
+    ]
+  ];
+
+  await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+}
+
+async function showSettings(env, chatId, editMsgId) {
+  const kv = env.BOT_KV;
+  const settings = await kv.get("settings", { type: "json" }) || {};
+  
+  const testChan = settings.testChannelId || env.TEST_CHANNEL_ID || "تنظیم نشده (از متغیرهای محیطی استفاده میشود)";
+  const tzLabel = settings.timezoneLabel || "تنظیم نشده (پیش‌فرض UTC)";
+  const admins = env.ADMIN_IDS || "هیچ مدیری تعریف نشده";
+
+  const text = `⚙️ <b>تنظیمات ربات کانال من</b>\n\n📲 <b>کانال تست فعلی:</b> <code>${testChan}</code>\n🕐 <b>منطقه زمانی فعلی:</b> <code>${tzLabel}</code>\n\n👥 <b>مدیران مجاز (فقط خواندنی):</b>\n<code>${admins}</code>\n\n<i>نکته: برای اضافه یا حذف کردن مدیران، باید متغیر ADMIN_IDS را در کنترل پنل کلودفلر ویرایش کنید.</i>`;
+
+  const keyboard = [
+    [
+      { text: "📲 تنظیم کانال تست جدید", callback_data: "settings_test_channel_start" },
+      { text: "🕐 تنظیم منطقه زمانی", callback_data: "settings_tz_start" }
+    ],
+    [{ text: "🏠 بازگشت به منوی اصلی", callback_data: "menu_main" }]
+  ];
+
+  // If clicking timezone setting, show options
+  if (stateStepIsTimezone(editMsgId, env)) {
+    // We add timezone choices below
+  }
+
+  // Let's create sub-menu timezone inside settings for simplicity
+  await editMessage(env, chatId, editMsgId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📲 تنظیم کانال تست", callback_data: "settings_test_channel_start" },
+          { text: "🕐 منطقه زمانی", callback_data: "settings_tz_menu" }
+        ],
+        [{ text: "🏠 بازگشت به منوی اصلی", callback_data: "menu_main" }]
+      ]
+    }
+  });
+}
+
+function stateStepIsTimezone(editMsgId, env) {
+  return false;
+}
+
+// Special callback router for settings sub menus
+async function editMessage(env, chatId, msgId, text, options = {}) {
+  return callTelegram(env, "editMessageText", {
+    chat_id: chatId,
+    message_id: msgId,
+    text: text,
+    parse_mode: "HTML",
+    ...options
+  });
+}
+
+/**
+ * TZ SUB MENU ROUTER EXTENSION
+ */
+async function handleTzMenu(env, chatId, editMsgId) {
+  const text = "🕐 <b>انتخاب منطقه زمانی پیش‌فرض</b>\n\nلطفاً برای محاسبه تاریخ و ساعت‌های زمانبندی، ریجن خود را انتخاب کنید:";
+  const keyboard = [
+    [
+      { text: "🇮🇷 تهران +3:30", callback_data: "settings_tz_tehran" },
+      { text: "🌍 UTC / گرینویچ", callback_data: "settings_tz_utc" },
+      { text: "🇦🇪 دبی +4", callback_data: "settings_tz_dubai" }
+    ],
+    [
+      { text: "✏️ وارد کردن دستی (به دقیقه)", callback_data: "settings_tz_custom_start" },
+      { text: "🔙 بازگشت به تنظیمات", callback_data: "menu_settings" }
+    ]
+  ];
+  await editMessage(env, chatId, editMsgId, text, { reply_markup: { inline_keyboard: keyboard } });
+}
+
+// Intercept specific custom settings routing
+const originalHandleCallback = handleCallback;
+handleCallback = async function(data, user, state, draft, message, env) {
+  if (data === "settings_tz_menu") {
+    await handleTzMenu(env, message.chat.id, message.message_id);
+    return;
+  }
+  await originalHandleCallback(data, user, state, draft, message, env);
+};
+
+/**
+ * CRON TRIGGER EXECUTION (process due posts)
+ */
+async function processScheduledPosts(env) {
+  const kv = env.BOT_KV;
+  if (!kv) return;
+
+  const index = await kv.get("scheduled_index", { type: "json" }) || [];
+  if (index.length === 0) return;
+
+  const now = Date.now();
+  const duePostIds = [];
+  const remainingPostIds = [];
+
+  for (const id of index) {
+    const p = await kv.get(`scheduled:${id}`, { type: "json" });
+    if (p) {
+      if (p.scheduleAt <= now) {
+        duePostIds.push(p);
+      } else {
+        remainingPostIds.push(id);
+      }
+    }
+  }
+
+  // Send due posts
+  for (const p of duePostIds) {
+    try {
+      console.log(`Sending due post ${p.id} to channel ${p.targetChannelId}`);
+      const res = await sendPostToTelegram(env, p.targetChannelId, p.post);
+      if (res.ok) {
+        // Remove from KV
+        await kv.delete(`scheduled:${p.id}`);
+      } else {
+        console.error(`Failed sending post ${p.id}:`, res.description);
+        // We still remove or keep? Better to notify admin or retry once.
+        // For safety on multiple failing loops, we remove it to prevent spamming errors.
+        await kv.delete(`scheduled:${p.id}`);
+      }
+    } catch (err) {
+      console.error(`Error sending due post ${p.id}:`, err);
+      await kv.delete(`scheduled:${p.id}`);
+    }
+  }
+
+  // Save updated index
+  await kv.put("scheduled_index", JSON.stringify(remainingPostIds));
+}
