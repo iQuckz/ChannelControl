@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
+
+// @ts-ignore
+import workerRaw from "../worker.js?raw";
 import {
   MessageSquare,
   Send,
@@ -58,6 +61,116 @@ function parseButtons(text: string) {
     keyboard.push(currentRow);
   }
   return keyboard;
+}
+
+function formatTimestamp(timestamp: number, offsetMinutes: number) {
+  const date = new Date(timestamp + offsetMinutes * 60 * 1000);
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  const h = String(date.getUTCHours()).padStart(2, "0");
+  const min = String(date.getUTCMinutes()).padStart(2, "0");
+  return `${y}/${m}/${d} - ${h}:${min}`;
+}
+
+function parseFriendlyDateTime(text: string, offsetMinutes: number): number | null {
+  // Normalize Persian/Arabic digits to English digits
+  text = text.replace(/[۰-۹]/g, d => "۰۱۲۳۴۵۶۷۸۹".indexOf(d).toString())
+             .replace(/[٠-٩]/g, d => "٠١٢٣٤٥٦٧٨٩".indexOf(d).toString())
+             .trim().toLowerCase();
+
+  const nowUtc = Date.now();
+  const localNow = new Date(nowUtc + offsetMinutes * 60 * 1000);
+
+  // Case A: Full Gregorian date-time like YYYY-MM-DD HH:mm or YYYY/MM/DD HH:mm
+  const fullMatch = text.match(/^(\d{4})[-/](\d{2})[-/](\d{2})\s+(\d{2}):(\d{2})$/);
+  if (fullMatch) {
+    const [_, year, month, day, hour, minute] = fullMatch.map(Number);
+    const utcDate = Date.UTC(year, month - 1, day, hour, minute);
+    if (!isNaN(utcDate)) {
+      return utcDate - offsetMinutes * 60 * 1000;
+    }
+  }
+
+  // Case B: Relative offsets like "30m", "+30", "1h", "2 ساعت"
+  const relativeMatch = text.match(/^\+?(\d+)\s*(min|m|دقیقه|دقیقه دیگر|دق)?$/);
+  if (relativeMatch && !text.includes(":")) {
+    const mins = parseInt(relativeMatch[1], 10);
+    const label = relativeMatch[2] || "m";
+    if (label === "m" || label === "min" || label.includes("دقیقه") || label === "دق") {
+      return nowUtc + mins * 60 * 1000;
+    }
+  }
+
+  const relativeHoursMatch = text.match(/^\+?(\d+)\s*(h|hour|ساعت|ساعت دیگر|س)?$/);
+  if (relativeHoursMatch && !text.includes(":")) {
+    const hrs = parseInt(relativeHoursMatch[1], 10);
+    return nowUtc + hrs * 60 * 60 * 1000;
+  }
+
+  // Case C: Relative phrases with clock time like "فردا 14:30" or "پس فردا 18:00" or just "18:00"
+  const timeMatch = text.match(/(\d{1,2}):(\d{2})/);
+  if (timeMatch) {
+    const hour = parseInt(timeMatch[1], 10);
+    const minute = parseInt(timeMatch[2], 10);
+    if (hour >= 0 && hour < 24 && minute >= 0 && minute < 60) {
+      let targetLocal = new Date(localNow);
+      targetLocal.setUTCHours(hour, minute, 0, 0);
+
+      let daysToAdd = 0;
+      if (text.includes("پس فردا")) {
+        daysToAdd = 2;
+      } else if (text.includes("فردا") || text.includes("farda")) {
+        daysToAdd = 1;
+      } else if (text.includes("امروز") || text.includes("emruz")) {
+        daysToAdd = 0;
+      } else {
+        // If they just entered "18:30" and that hour has already passed today, assume tomorrow!
+        if (targetLocal.getTime() <= localNow.getTime()) {
+          daysToAdd = 1;
+        }
+      }
+
+      if (daysToAdd > 0) {
+        targetLocal.setUTCDate(targetLocal.getUTCDate() + daysToAdd);
+      }
+      
+      return targetLocal.getTime() - offsetMinutes * 60 * 1000;
+    }
+  }
+
+  return null;
+}
+
+function calculatePresetTimestamp(preset: string, offsetMinutes: number): number {
+  const nowUtc = Date.now();
+  const localNow = new Date(nowUtc + offsetMinutes * 60 * 1000);
+  let targetLocal = new Date(localNow);
+
+  if (preset === "15m") {
+    return nowUtc + 15 * 60 * 1000;
+  } else if (preset === "30m") {
+    return nowUtc + 30 * 60 * 1000;
+  } else if (preset === "1h") {
+    return nowUtc + 60 * 60 * 1000;
+  } else if (preset === "2h") {
+    return nowUtc + 2 * 60 * 60 * 1000;
+  } else if (preset === "5h") {
+    return nowUtc + 5 * 60 * 60 * 1000;
+  } else if (preset === "12h") {
+    return nowUtc + 12 * 60 * 60 * 1000;
+  } else if (preset === "tomorrow_morning") {
+    targetLocal.setUTCDate(targetLocal.getUTCDate() + 1);
+    targetLocal.setUTCHours(9, 0, 0, 0);
+    return targetLocal.getTime() - offsetMinutes * 60 * 1000;
+  } else if (preset === "tomorrow_night") {
+    targetLocal.setUTCDate(targetLocal.getUTCDate() + 1);
+    targetLocal.setUTCHours(21, 0, 0, 0);
+    return targetLocal.getTime() - offsetMinutes * 60 * 1000;
+  } else if (preset === "tomorrow_same") {
+    return nowUtc + 24 * 60 * 60 * 1000;
+  }
+  return nowUtc;
 }
 
 export default function App() {
@@ -152,57 +265,7 @@ export default function App() {
 
   // Handle dynamic worker code output
   const getWorkerCode = () => {
-    return `/**
- * Cloudflare Worker: Telegram Channel Manager Bot
- * Custom Generated Code - 100% Client-Side Ready
- */
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (request.method === "GET" && url.pathname === "/health") {
-      return new Response(JSON.stringify({ status: "healthy", time: new Date().toISOString() }), {
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
-    if (request.method === "GET" && url.pathname === "/setWebhook") {
-      const botToken = env.BOT_TOKEN || "${botToken}";
-      const workerUrl = \`\${url.protocol}//\${url.host}/webhook\`;
-      const tgUrl = \`https://api.telegram.org/bot\${botToken}/setWebhook?url=\${encodeURIComponent(workerUrl)}\`;
-      
-      try {
-        const res = await fetch(tgUrl);
-        const data = await res.json();
-        return new Response(JSON.stringify({ message: "Webhook registration attempt", telegramResponse: data }), {
-          headers: { "Content-Type": "application/json" }
-        });
-      } catch (err) {
-        return new Response(\`Error: \${err.message}\`, { status: 500 });
-      }
-    }
-
-    if (request.method === "POST" && (url.pathname === "/webhook" || url.pathname === "/")) {
-      try {
-        const update = await request.json();
-        ctx.waitUntil(handleTelegramUpdate(update, env));
-        return new Response("OK", { status: 200 });
-      } catch (err) {
-        return new Response("Error", { status: 500 });
-      }
-    }
-
-    return new Response("Telegram Bot Worker is active! Visit /setWebhook to set up.", { status: 200 });
-  },
-
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(processScheduledPosts(env));
-  }
-};
-
-// ... Entire state machine inside worker.js (Complete logic already written in /worker.js)
-`;
+    return workerRaw;
   };
 
   // Helper to add message in simulator
@@ -482,24 +545,98 @@ export default {
 
       if (callbackData === "post_send_schedule") {
         setState({ ...state, step: "AWAITING_SCHEDULE_TIME" });
-        addMsg("bot", "⏱️ <b>زمانبندی ارسال پست</b>\n\nلطفاً تاریخ و زمان ارسال را دقیقاً به فرمت میلادی زیر ارسال کنید:\n\n<code>YYYY-MM-DD HH:mm</code>\n\n<i>مثال: 2026-08-15 14:30</i>");
+        const tzLabel = kvStore.settings.timezoneLabel || "Tehran (UTC+3:30)";
+        addMsg("bot", `⏱️ <b>زمان‌بندی ارسال خودکار</b>\n\nمنطقه زمانی فعلی شما: <b>${tzLabel}</b>\n\nیکی از زمان‌های پیشنهادی زیر را انتخاب کنید یا خودتان زمان خاصی بنویسید:\n\n<b>مثال‌های ورود دستی قابل قبول:</b>\n- <code>18:30</code> (امروز ساعت ۱۸:۳۰ یا فردا)\n- <code>فردا 14:00</code>\n- <code>پس فردا 21:00</code>\n- <code>2026-07-15 14:30</code> (فرمت کامل میلادی)\n\n<i>نکته: زبان ارقام (فارسی یا انگلیسی) اهمیتی ندارد.</i>`, [
+          [
+            { text: "⏱️ ۱۵ دقیقه دیگر", callback_data: "post_sched_preset:15m" },
+            { text: "⏱️ ۳۰ دقیقه دیگر", callback_data: "post_sched_preset:30m" }
+          ],
+          [
+            { text: "⏱️ ۱ ساعت دیگر", callback_data: "post_sched_preset:1h" },
+            { text: "⏱️ ۲ ساعت دیگر", callback_data: "post_sched_preset:2h" }
+          ],
+          [
+            { text: "⏱️ ۵ ساعت دیگر", callback_data: "post_sched_preset:5h" },
+            { text: "⏱️ ۱۲ ساعت دیگر", callback_data: "post_sched_preset:12h" }
+          ],
+          [
+            { text: "🌅 فردا صبح (۰۹:۰۰)", callback_data: "post_sched_preset:tomorrow_morning" },
+            { text: "🌌 فردا شب (۲۱:۰۰)", callback_data: "post_sched_preset:tomorrow_night" }
+          ],
+          [
+            { text: "📅 فردا همین ساعت", callback_data: "post_sched_preset:tomorrow_same" }
+          ],
+          [
+            { text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }
+          ]
+        ]);
         return;
       }
 
-      // Post timezone select
-      if (callbackData.startsWith("post_tz_select:")) {
-        const tz = callbackData.replace("post_tz_select:", "");
-        let offsetLabel = tz === "tehran" ? "Tehran (UTC+3:30)" : tz === "dubai" ? "Dubai (UTC+4)" : "UTC";
+      if (callbackData.startsWith("post_sched_preset:")) {
+        const preset = callbackData.replace("post_sched_preset:", "");
+        const offset = kvStore.settings.timezoneOffset !== undefined ? kvStore.settings.timezoneOffset : 210;
+        const tzLabel = kvStore.settings.timezoneLabel || "Tehran (UTC+3:30)";
         
-        // Add to simulated schedule index
+        const timestamp = calculatePresetTimestamp(preset, offset);
+        const formattedTime = formatTimestamp(timestamp, offset);
+        
+        setDraft((prev: any) => ({ ...prev, scheduleAt: timestamp }));
+        
+        addMsg("bot", `⏰ <b>تایید زمان‌بندی پست</b>\n\n📍 کانال مقصد: <b>${state.targetChannelName || "کانال تکنولوژی من"}</b>\n📅 زمان ارسال: <b>${formattedTime}</b>\n🌐 منطقه زمانی: <b>${tzLabel}</b>\n\nآیا این زمان‌بندی را تایید می‌کنید؟`, [
+          [
+            { text: "✅ تایید و ذخیره", callback_data: "post_schedule_save" },
+            { text: "✏️ تغییر زمان", callback_data: "post_send_schedule" }
+          ],
+          [{ text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }]
+        ]);
+        return;
+      }
+
+      if (callbackData === "post_schedule_save") {
+        const offset = kvStore.settings.timezoneOffset !== undefined ? kvStore.settings.timezoneOffset : 210;
+        const finalTime = draft.scheduleAt ? formatTimestamp(draft.scheduleAt, offset) : "نامشخص";
+        
         const updatedKv = { ...kvStore };
         const simulatedPostId = "post_" + Date.now();
         const schedObj = {
           id: simulatedPostId,
           targetChannelId: state.targetChannelId || "-1001111111111",
           targetChannelName: state.targetChannelName || "کانال تکنولوژی من",
-          post: { ...draft, scheduleAt: draft.tempScheduleTime },
-          scheduleAt: draft.tempScheduleTime,
+          post: { ...draft },
+          scheduleAt: draft.scheduleAt || Date.now() + 3600000,
+          timezone: kvStore.settings.timezone || "tehran"
+        };
+        
+        updatedKv[`scheduled:${simulatedPostId}`] = schedObj;
+        updatedKv.scheduled_index.push(simulatedPostId);
+        setKvStore(updatedKv);
+
+        addMsg("bot", `🎉 <b>پست شما با موفقیت زمان‌بندی شد!</b>\n\n📍 کانال: <b>${state.targetChannelName || "کانال تکنولوژی من"}</b>\n⏰ زمان ارسال: <b>${finalTime}</b>\n\nدر زمان فوق به صورت خودکار منتشر خواهد شد.`, [
+          [{ text: "🏠 بازگشت به منوی اصلی", callback_data: "menu_main" }]
+        ]);
+
+        setState({ step: "MAIN_MENU" });
+        return;
+      }
+
+      // Post timezone select (fallback)
+      if (callbackData.startsWith("post_tz_select:")) {
+        const tz = callbackData.replace("post_tz_select:", "");
+        let offset = tz === "tehran" ? 210 : tz === "dubai" ? 240 : 0;
+        let offsetLabel = tz === "tehran" ? "Tehran (UTC+3:30)" : tz === "dubai" ? "Dubai (UTC+4)" : "UTC";
+        
+        const timestamp = parseFriendlyDateTime(draft.tempScheduleTime || "", offset) || (Date.now() + 3600000);
+        const formattedTime = formatTimestamp(timestamp, offset);
+
+        const updatedKv = { ...kvStore };
+        const simulatedPostId = "post_" + Date.now();
+        const schedObj = {
+          id: simulatedPostId,
+          targetChannelId: state.targetChannelId || "-1001111111111",
+          targetChannelName: state.targetChannelName || "کانال تکنولوژی من",
+          post: { ...draft, scheduleAt: timestamp },
+          scheduleAt: timestamp,
           timezone: tz
         };
         
@@ -507,11 +644,10 @@ export default {
         updatedKv.scheduled_index.push(simulatedPostId);
         setKvStore(updatedKv);
 
-        addMsg("bot", `🎉 <b>پست شما با موفقیت زمانبندی شد!</b>\n\n📍 کانال: <b>${state.targetChannelName}</b>\n⏰ زمان: <b>${draft.tempScheduleTime}</b> (${offsetLabel})\n\nدر تاریخ فوق به صورت خودکار منتشر خواهد شد.`, [
+        addMsg("bot", `🎉 <b>پست شما با موفقیت زمانبندی شد!</b>\n\n📍 کانال: <b>${state.targetChannelName}</b>\n⏰ زمان: <b>${formattedTime}</b> (${offsetLabel})\n\nدر تاریخ فوق به صورت خودکار منتشر خواهد شد.`, [
           [{ text: "🏠 بازگشت به منوی اصلی", callback_data: "menu_main" }]
         ]);
 
-        // Reset
         setState({ step: "MAIN_MENU" });
         return;
       }
@@ -696,20 +832,24 @@ export default {
 
       // Step: AWAITING_SCHEDULE_TIME
       if (state.step === "AWAITING_SCHEDULE_TIME") {
-        const match = txt.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/);
-        if (!match) {
-          addMsg("bot", "⚠️ فرمت وارد شده نامعتبر است. لطفاً فرمت میلادی دقیقاً به شکل زیر ارسال کنید:\n\n<code>2026-08-15 14:30</code>");
+        const offset = kvStore.settings.timezoneOffset !== undefined ? kvStore.settings.timezoneOffset : 210;
+        const tzLabel = kvStore.settings.timezoneLabel || "Tehran (UTC+3:30)";
+        
+        const timestamp = parseFriendlyDateTime(txt, offset);
+        if (!timestamp) {
+          addMsg("bot", "⚠️ متوجه زمان وارد شده نشدم! لطفاً یک ساعت یا فرمت معتبر بنویسید.\n\nمثال‌ها:\n- <code>18:30</code>\n- <code>فردا 14:00</code>\n- <code>2026-07-15 14:30</code>");
           return;
         }
 
-        setDraft(prev => ({ ...prev, tempScheduleTime: txt }));
-        addMsg("bot", "🌐 <b>انتخاب منطقه زمانی (Timezone)</b>\n\nلطفاً منطقه زمانی تاریخ ثبت شده را انتخاب کنید تا محاسبات دقیق کلودفلر انجام شود:", [
+        const formattedTime = formatTimestamp(timestamp, offset);
+        setDraft((prev: any) => ({ ...prev, scheduleAt: timestamp }));
+        
+        addMsg("bot", `⏰ <b>تایید زمان‌بندی پست</b>\n\n📍 کانال مقصد: <b>${state.targetChannelName || "کانال تکنولوژی من"}</b>\n📅 زمان ارسال: <b>${formattedTime}</b>\n🌐 منطقه زمانی: <b>${tzLabel}</b>\n\nآیا این زمان‌بندی را تایید می‌کنید؟`, [
           [
-            { text: "🇮🇷 تهران UTC+3:30", callback_data: "post_tz_select:tehran" },
-            { text: "🌍 UTC / گرینویچ", callback_data: "post_tz_select:utc" },
-            { text: "🇦🇪 دبی UTC+4", callback_data: "post_tz_select:dubai" }
+            { text: "✅ تایید و ذخیره", callback_data: "post_schedule_save" },
+            { text: "✏️ تغییر زمان", callback_data: "post_send_schedule" }
           ],
-          [{ text: "🔙 بازگشت", callback_data: "post_test_confirm" }]
+          [{ text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }]
         ]);
         return;
       }
@@ -799,9 +939,11 @@ export default {
 
   const showScheduledPostsSim = () => {
     const keys = Object.keys(kvStore).filter(k => k.startsWith("scheduled:"));
+    const offset = kvStore.settings.timezoneOffset !== undefined ? kvStore.settings.timezoneOffset : 210;
     const listBtns = keys.map(k => {
       const obj = kvStore[k];
-      return [{ text: `📅 ${obj.scheduleAt} | ${obj.targetChannelName}`, callback_data: `sched_view:${obj.id}` }];
+      const timeStr = typeof obj.scheduleAt === "number" ? formatTimestamp(obj.scheduleAt, offset) : obj.scheduleAt;
+      return [{ text: `📅 ${timeStr} | ${obj.targetChannelName}`, callback_data: `sched_view:${obj.id}` }];
     });
 
     addMsg("bot", "<b>📋 لیست پست‌های زمانبندی شده فعال:</b>\n\nبرای مشاهده جزییات یا حذف پست کلیک کنید:", [

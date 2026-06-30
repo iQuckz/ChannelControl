@@ -119,18 +119,104 @@ function parseButtons(text) {
 }
 
 function parseDateTimeWithOffset(dateStr, offsetMinutes) {
-  // dateStr format: YYYY-MM-DD HH:mm
-  const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/);
-  if (!match) return null;
-  const [_, year, month, day, hour, minute] = match.map(Number);
-  
-  // Create UTC date components
-  const utcDate = Date.UTC(year, month - 1, day, hour, minute);
-  if (isNaN(utcDate)) return null;
-  
-  // Convert local timezone to true UTC timestamp
-  // If offset is +3:30 (+210 mins), we subtract 210 mins to get UTC timestamp
-  return utcDate - offsetMinutes * 60 * 1000;
+  if (!dateStr) return null;
+  // Normalize Persian/Arabic digits to English digits
+  dateStr = dateStr.replace(/[۰-۹]/g, d => "۰۱۲۳۴۵۶۷۸۹".indexOf(d).toString())
+                   .replace(/[٠-٩]/g, d => "٠١٢٣٤٥٦٧٨٩".indexOf(d).toString())
+                   .trim().toLowerCase();
+
+  const nowUtc = Date.now();
+  const localNow = new Date(nowUtc + offsetMinutes * 60 * 1000);
+
+  // Case A: Full Gregorian date-time like YYYY-MM-DD HH:mm or YYYY/MM/DD HH:mm
+  const fullMatch = dateStr.match(/^(\d{4})[-/](\d{2})[-/](\d{2})\s+(\d{2}):(\d{2})$/);
+  if (fullMatch) {
+    const [_, year, month, day, hour, minute] = fullMatch.map(Number);
+    const utcDate = Date.UTC(year, month - 1, day, hour, minute);
+    if (!isNaN(utcDate)) {
+      return utcDate - offsetMinutes * 60 * 1000;
+    }
+  }
+
+  // Case B: Relative offsets like "30m", "+30", "1h", "2 ساعت"
+  const relativeMatch = dateStr.match(/^\+?(\d+)\s*(min|m|دقیقه|دقیقه دیگر|دق)?$/);
+  if (relativeMatch && !dateStr.includes(":")) {
+    const mins = parseInt(relativeMatch[1], 10);
+    const label = relativeMatch[2] || "m";
+    if (label === "m" || label === "min" || label.includes("دقیقه") || label === "دق") {
+      return nowUtc + mins * 60 * 1000;
+    }
+  }
+
+  const relativeHoursMatch = dateStr.match(/^\+?(\d+)\s*(h|hour|ساعت|ساعت دیگر|س)?$/);
+  if (relativeHoursMatch && !dateStr.includes(":")) {
+    const hrs = parseInt(relativeHoursMatch[1], 10);
+    return nowUtc + hrs * 60 * 60 * 1000;
+  }
+
+  // Case C: Relative phrases with clock time like "فردا 14:30" or "پس فردا 18:00" or just "18:00"
+  const timeMatch = dateStr.match(/(\d{1,2}):(\d{2})/);
+  if (timeMatch) {
+    const hour = parseInt(timeMatch[1], 10);
+    const minute = parseInt(timeMatch[2], 10);
+    if (hour >= 0 && hour < 24 && minute >= 0 && minute < 60) {
+      let targetLocal = new Date(localNow);
+      targetLocal.setUTCHours(hour, minute, 0, 0);
+
+      let daysToAdd = 0;
+      if (dateStr.includes("پس فردا")) {
+        daysToAdd = 2;
+      } else if (dateStr.includes("فردا") || dateStr.includes("farda")) {
+        daysToAdd = 1;
+      } else if (dateStr.includes("امروز") || dateStr.includes("emruz")) {
+        daysToAdd = 0;
+      } else {
+        // If they just entered "18:30" and that hour has already passed today, assume tomorrow!
+        if (targetLocal.getTime() <= localNow.getTime()) {
+          daysToAdd = 1;
+        }
+      }
+
+      if (daysToAdd > 0) {
+        targetLocal.setUTCDate(targetLocal.getUTCDate() + daysToAdd);
+      }
+      
+      return targetLocal.getTime() - offsetMinutes * 60 * 1000;
+    }
+  }
+
+  return null;
+}
+
+function calculatePresetTimestamp(preset, offsetMinutes) {
+  const nowUtc = Date.now();
+  const localNow = new Date(nowUtc + offsetMinutes * 60 * 1000);
+  let targetLocal = new Date(localNow);
+
+  if (preset === "15m") {
+    return nowUtc + 15 * 60 * 1000;
+  } else if (preset === "30m") {
+    return nowUtc + 30 * 60 * 1000;
+  } else if (preset === "1h") {
+    return nowUtc + 60 * 60 * 1000;
+  } else if (preset === "2h") {
+    return nowUtc + 2 * 60 * 60 * 1000;
+  } else if (preset === "5h") {
+    return nowUtc + 5 * 60 * 60 * 1000;
+  } else if (preset === "12h") {
+    return nowUtc + 12 * 60 * 60 * 1000;
+  } else if (preset === "tomorrow_morning") {
+    targetLocal.setUTCDate(targetLocal.getUTCDate() + 1);
+    targetLocal.setUTCHours(9, 0, 0, 0);
+    return targetLocal.getTime() - offsetMinutes * 60 * 1000;
+  } else if (preset === "tomorrow_night") {
+    targetLocal.setUTCDate(targetLocal.getUTCDate() + 1);
+    targetLocal.setUTCHours(21, 0, 0, 0);
+    return targetLocal.getTime() - offsetMinutes * 60 * 1000;
+  } else if (preset === "tomorrow_same") {
+    return nowUtc + 24 * 60 * 60 * 1000;
+  }
+  return nowUtc;
 }
 
 function formatTimestamp(timestamp, offsetMinutes) {
@@ -604,10 +690,64 @@ async function handleCallback(data, user, state, draft, message, env) {
     state.step = "AWAITING_SCHEDULE_TIME";
     await kv.put(`state:${user.id}`, JSON.stringify(state));
 
-    const text = "⏱️ <b>زمانبندی ارسال پست</b>\n\nلطفاً تاریخ و زمان ارسال را به فرمت میلادی زیر ارسال کنید:\n\n<code>YYYY-MM-DD HH:mm</code>\n\n<i>مثال: 2025-08-15 14:30</i>";
+    const settings = await kv.get("settings", { type: "json" }) || {};
+    const tzLabel = settings.timezoneLabel || "Tehran (UTC+3:30)";
+
+    const text = `⏱️ <b>زمان‌بندی ارسال خودکار</b>\n\nمنطقه زمانی فعلی شما: <b>${tzLabel}</b>\n\nیکی از زمان‌های پیشنهادی زیر را انتخاب کنید یا خودتان زمان خاصی بنویسید:\n\n<b>مثال‌های ورود دستی قابل قبول:</b>\n- <code>18:30</code> (امروز ساعت ۱۸:۳۰ یا فردا)\n- <code>فردا 14:00</code>\n- <code>پس فردا 21:00</code>\n- <code>2026-07-15 14:30</code> (فرمت کامل میلادی)\n\n<i>نکته: زبان ارقام (فارسی یا انگلیسی) اهمیتی ندارد.</i>`;
     await editMessage(env, chatId, msgId, text, {
       reply_markup: {
-        inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: "post_test_confirm" }]]
+        inline_keyboard: [
+          [
+            { text: "⏱️ ۱۵ دقیقه دیگر", callback_data: "post_sched_preset:15m" },
+            { text: "⏱️ ۳۰ دقیقه دیگر", callback_data: "post_sched_preset:30m" }
+          ],
+          [
+            { text: "⏱️ ۱ ساعت دیگر", callback_data: "post_sched_preset:1h" },
+            { text: "⏱️ ۲ ساعت دیگر", callback_data: "post_sched_preset:2h" }
+          ],
+          [
+            { text: "⏱️ ۵ ساعت دیگر", callback_data: "post_sched_preset:5h" },
+            { text: "⏱️ ۱۲ ساعت دیگر", callback_data: "post_sched_preset:12h" }
+          ],
+          [
+            { text: "🌅 فردا صبح (۰۹:۰۰)", callback_data: "post_sched_preset:tomorrow_morning" },
+            { text: "🌌 فردا شب (۲۱:۰۰)", callback_data: "post_sched_preset:tomorrow_night" }
+          ],
+          [
+            { text: "📅 فردا همین ساعت", callback_data: "post_sched_preset:tomorrow_same" }
+          ],
+          [
+            { text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }
+          ]
+        ]
+      }
+    });
+    return;
+  }
+
+  if (data.startsWith("post_sched_preset:")) {
+    const preset = data.replace("post_sched_preset:", "");
+    const settings = await kv.get("settings", { type: "json" }) || {};
+    const offset = settings.timezoneOffset !== undefined ? settings.timezoneOffset : 210;
+    const tzLabel = settings.timezoneLabel || "Tehran (UTC+3:30)";
+
+    const timestamp = calculatePresetTimestamp(preset, offset);
+    const formatLabel = formatTimestamp(timestamp, offset);
+
+    draft.scheduleAt = timestamp;
+    await kv.put(`draft:${user.id}`, JSON.stringify(draft));
+
+    // Show Confirmation
+    const text = `📋 <b>تایید زمانبندی پست</b>\n\n📍 کانال مقصد: <b>${state.targetChannelName}</b>\n⏰ زمان ارسال: <b>${formatLabel}</b>\n🌐 منطقه زمانی: <b>${tzLabel}</b>\n\nآیا این زمانبندی را تایید میکنید؟`;
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ تایید و ذخیره زمانبندی", callback_data: `post_schedule_save:${settings.timezone || "tehran"}` },
+            { text: "✏️ تغییر زمان", callback_data: "post_send_schedule" }
+          ],
+          [{ text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }]
+        ]
       }
     });
     return;
@@ -633,7 +773,7 @@ async function handleCallback(data, user, state, draft, message, env) {
 
     // Show Confirmation
     const formatLabel = formatTimestamp(timestamp, offset);
-    const text = `📋 <b>تایید زمانبندی پست</b>\n\n📍 کانال مقصد: <b>${state.targetChannelName}</b>\n⏰ زمان ارسال: <b>${formatLabel}</b>\n🌐 ریجن: <b>${tz.toUpperCase()}</b>\n\nآیا این زمانبندی را تایید میکنید؟`;
+    const text = `📋 <b>تایید زمانبندی پست</b>\n\n📍 کانال مقصد: <b>${state.targetChannelName}</b>\n⏰ زمان ارسال: <b>${formatLabel}</b>\n🌐 منطقه زمانی: <b>${tz.toUpperCase()}</b>\n\nآیا این زمانبندی را تایید میکنید؟`;
     
     await editMessage(env, chatId, msgId, text, {
       reply_markup: {
@@ -982,37 +1122,37 @@ async function handleMessage(message, user, state, draft, env) {
   }
 
   if (state.step === "AWAITING_SCHEDULE_TIME") {
-    // Validate format YYYY-MM-DD HH:mm
-    const match = text.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/);
-    if (!match) {
-      await sendMessage(env, chatId, "⚠️ فرمت وارد شده نامعتبر است. نمونه: <code>2025-08-15 14:30</code>");
+    const settings = await kv.get("settings", { type: "json" }) || {};
+    const offset = settings.timezoneOffset !== undefined ? settings.timezoneOffset : 210;
+    const tzLabel = settings.timezoneLabel || "Tehran (UTC+3:30)";
+
+    const timestamp = parseDateTimeWithOffset(text, offset);
+    if (!timestamp) {
+      await sendMessage(env, chatId, "⚠️ متوجه زمان وارد شده نشدم! لطفاً یک ساعت یا فرمت معتبر بنویسید.\n\nمثال‌ها:\n- <code>18:30</code>\n- <code>فردا 14:00</code>\n- <code>2026-07-15 14:30</code>");
       return;
     }
 
-    draft.tempScheduleTime = text;
+    draft.scheduleAt = timestamp;
     await kv.put(`draft:${user.id}`, JSON.stringify(draft));
 
-    // Ask timezone
-    const textTz = "🌐 <b>انتخاب منطقه زمانی (Timezone)</b>\n\nلطفاً منطقه زمانی تاریخ ثبت شده را انتخاب کنید:";
-    const keyboard = [
-      [
-        { text: "🇮🇷 تهران UTC+3:30", callback_data: "post_tz_select:tehran" },
-        { text: "🌍 UTC / گرینویچ", callback_data: "post_tz_select:utc" },
-        { text: "🇦🇪 دبی UTC+4", callback_data: "post_tz_select:dubai" }
-      ],
-      [{ text: "🔙 بازگشت", callback_data: "post_test_confirm" }]
-    ];
-    await sendMessage(env, chatId, textTz, { reply_markup: { inline_keyboard: keyboard } });
+    const formatLabel = formatTimestamp(timestamp, offset);
+    const confirmText = `📋 <b>تایید زمانبندی پست</b>\n\n📍 کانال مقصد: <b>${state.targetChannelName}</b>\n⏰ زمان ارسال: <b>${formatLabel}</b>\n🌐 منطقه زمانی: <b>${tzLabel}</b>\n\nآیا این زمانبندی را تایید میکنید؟`;
+
+    await sendMessage(env, chatId, confirmText, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ تایید و ذخیره زمانبندی", callback_data: `post_schedule_save:${settings.timezone || "tehran"}` },
+            { text: "✏️ تغییر زمان", callback_data: "post_send_schedule" }
+          ],
+          [{ text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }]
+        ]
+      }
+    });
     return;
   }
 
   if (state.step === "AWAITING_EDIT_SCHEDULE_TIME") {
-    const match = text.match(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/);
-    if (!match) {
-      await sendMessage(env, chatId, "⚠️ فرمت نامعتبر است. نمونه: <code>2025-08-15 14:30</code>");
-      return;
-    }
-
     const postId = state.editingPostId;
     const schedObj = await kv.get(`scheduled:${postId}`, { type: "json" });
     if (!schedObj) {
@@ -1020,13 +1160,12 @@ async function handleMessage(message, user, state, draft, env) {
       return;
     }
 
-    // Get current timezone setting
     const settings = await kv.get("settings", { type: "json" }) || {};
-    const offset = settings.timezoneOffset || 0;
+    const offset = settings.timezoneOffset !== undefined ? settings.timezoneOffset : 210;
 
     const timestamp = parseDateTimeWithOffset(text, offset);
     if (!timestamp) {
-      await sendMessage(env, chatId, "⚠️ مقدار زمان نامعتبر است.");
+      await sendMessage(env, chatId, "⚠️ متوجه زمان وارد شده نشدم! لطفاً یک ساعت یا فرمت معتبر بنویسید.\n\nمثال‌ها:\n- <code>18:30</code>\n- <code>فردا 14:00</code>\n- <code>2026-07-15 14:30</code>");
       return;
     }
 
