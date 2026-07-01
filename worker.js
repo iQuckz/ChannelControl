@@ -819,9 +819,11 @@ async function handleCallback(data, user, state, draft, message, env) {
     await kv.put(`state:${user.id}`, JSON.stringify(state));
 
     const settings = await kv.get("settings", { type: "json" }) || {};
+    const offset = settings.timezoneOffset !== undefined ? settings.timezoneOffset : 210;
     const tzLabel = settings.timezoneLabel || "Tehran (UTC+3:30)";
+    const currentLocalTime = formatTimestamp(Date.now(), offset);
 
-    const text = `⏱️ <b>زمان‌بندی ارسال خودکار</b>\n\nمنطقه زمانی فعلی شما: <b>${tzLabel}</b>\n\nیکی از زمان‌های پیشنهادی زیر را انتخاب کنید یا خودتان زمان خاصی بنویسید:\n\n<b>مثال‌های ورود دستی قابل قبول:</b>\n- <code>18:30</code> (امروز ساعت ۱۸:۳۰ یا فردا)\n- <code>فردا 14:00</code>\n- <code>پس فردا 21:00</code>\n- <code>2026-07-15 14:30</code> (فرمت کامل میلادی)\n\n<i>نکته: زبان ارقام (فارسی یا انگلیسی) اهمیتی ندارد.</i>`;
+    const text = `⏱️ <b>زمان‌بندی ارسال خودکار</b>\n\n🌐 منطقه زمانی: <b>${tzLabel}</b>\n🕐 ساعت فعلی شما از نظر ربات: <b>${currentLocalTime}</b>\n\nیکی از زمان‌های پیشنهادی زیر را انتخاب کنید یا خودتان زمان خاصی بنویسید:\n\n<b>مثال‌های ورود دستی قابل قبول:</b>\n- <code>18:30</code> (امروز ساعت ۱۸:۳۰ یا فردا)\n- <code>فردا 14:00</code>\n- <code>پس فردا 21:00</code>\n- <code>2026-07-15 14:30</code> (فرمت کامل میلادی)\n\n<i>نکته: زبان ارقام (فارسی یا انگلیسی) اهمیتی ندارد.</i>`;
     await editMessage(env, chatId, msgId, text, {
       reply_markup: {
         inline_keyboard: [
@@ -843,6 +845,101 @@ async function handleCallback(data, user, state, draft, message, env) {
           ],
           [
             { text: "📅 فردا همین ساعت", callback_data: "post_sched_preset:tomorrow_same" }
+          ],
+          [
+            { text: "⚙️ تنظیم منطقه زمانی (تغییر ساعت ربات)", callback_data: "post_sched_change_tz" }
+          ],
+          [
+            { text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }
+          ]
+        ]
+      }
+    });
+    return;
+  }
+
+  if (data === "post_sched_change_tz") {
+    const text = "🕐 <b>تنظیم سریع منطقه زمانی</b>\n\nلطفاً منطقه زمانی هماهنگ با ساعت گوشی خود را انتخاب کنید تا زمانبندی‌ها کاملاً دقیق باشند:";
+    await editMessage(env, chatId, msgId, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "🇮🇷 تهران UTC+3:30", callback_data: "post_sched_set_tz:tehran" },
+            { text: "🌍 UTC / گرینویچ", callback_data: "post_sched_set_tz:utc" },
+            { text: "🇦🇪 دبی UTC+4", callback_data: "post_sched_set_tz:dubai" }
+          ],
+          [
+            { text: "✏️ وارد کردن دستی اختلاف ساعت (به دقیقه)", callback_data: "post_sched_set_tz:custom" }
+          ],
+          [
+            { text: "🔙 بازگشت به زمان‌بندی", callback_data: "post_send_schedule" }
+          ]
+        ]
+      }
+    });
+    return;
+  }
+
+  if (data.startsWith("post_sched_set_tz:")) {
+    const tz = data.replace("post_sched_set_tz:", "");
+    if (tz === "custom") {
+      state.step = "AWAITING_POST_SCHED_TZ_CUSTOM";
+      await kv.put(`state:${user.id}`, JSON.stringify(state));
+      const text = "🕐 <b>تنظیم دستی منطقه زمانی</b>\n\nلطفاً اختلاف زمانی با UTC (گرینویچ) را به <b>دقیقه</b> وارد کنید.\n\n<i>مثال‌ها:</i>\n- ایران (نیمه دوم سال): <code>210</code>\n- ایران (نیمه اول سال): <code>270</code>\n- افغانستان: <code>270</code>\n- اروپا (برلین): <code>60</code>\n- ترکیه: <code>180</code>";
+      await editMessage(env, chatId, msgId, text, {
+        reply_markup: {
+          inline_keyboard: [[{ text: "🔙 بازگشت", callback_data: "post_sched_change_tz" }]]
+        }
+      });
+      return;
+    }
+
+    let offset = 0;
+    let label = "UTC";
+    if (tz === "tehran") { offset = 210; label = "Tehran (UTC+3:30)"; }
+    else if (tz === "dubai") { offset = 240; label = "Dubai (UTC+4)"; }
+    else if (tz === "utc") { offset = 0; label = "UTC"; }
+
+    let settings = await kv.get("settings", { type: "json" }) || {};
+    settings.timezone = tz;
+    settings.timezoneOffset = offset;
+    settings.timezoneLabel = label;
+    await kv.put("settings", JSON.stringify(settings));
+
+    await callTelegram(env, "answerCallbackQuery", {
+      callback_query_id: data,
+      text: `منطقه زمانی به ${label} تغییر یافت. ساعت شما تنظیم شد!`,
+      show_alert: true
+    });
+
+    state.step = "AWAITING_SCHEDULE_TIME";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+    const currentLocalTime = formatTimestamp(Date.now(), offset);
+    const schedText = `⏱️ <b>زمان‌بندی ارسال خودکار</b>\n\n🌐 منطقه زمانی: <b>${label}</b>\n🕐 ساعت فعلی شما از نظر ربات: <b>${currentLocalTime}</b>\n\nیکی از زمان‌های پیشنهادی زیر را انتخاب کنید یا خودتان زمان خاصی بنویسید:\n\n<b>مثال‌های ورود دستی قابل قبول:</b>\n- <code>18:30</code> (امروز ساعت ۱۸:۳۰ یا فردا)\n- <code>فردا 14:00</code>\n- <code>پس فردا 21:00</code>\n- <code>2026-07-15 14:30</code> (فرمت کامل میلادی)\n\n<i>نکته: زبان ارقام (فارسی یا انگلیسی) اهمیتی ندارد.</i>`;
+    await editMessage(env, chatId, msgId, schedText, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "⏱️ ۱۵ دقیقه دیگر", callback_data: "post_sched_preset:15m" },
+            { text: "⏱️ ۳۰ دقیقه دیگر", callback_data: "post_sched_preset:30m" }
+          ],
+          [
+            { text: "⏱️ ۱ ساعت دیگر", callback_data: "post_sched_preset:1h" },
+            { text: "⏱️ ۲ ساعت دیگر", callback_data: "post_sched_preset:2h" }
+          ],
+          [
+            { text: "⏱️ ۵ ساعت دیگر", callback_data: "post_sched_preset:5h" },
+            { text: "⏱️ ۱۲ ساعت دیگر", callback_data: "post_sched_preset:12h" }
+          ],
+          [
+            { text: "🌅 فردا صبح (۰۹:۰۰)", callback_data: "post_sched_preset:tomorrow_morning" },
+            { text: "🌌 فردا شب (۲۱:۰۰)", callback_data: "post_sched_preset:tomorrow_night" }
+          ],
+          [
+            { text: "📅 فردا همین ساعت", callback_data: "post_sched_preset:tomorrow_same" }
+          ],
+          [
+            { text: "⚙️ تنظیم منطقه زمانی (تغییر ساعت ربات)", callback_data: "post_sched_change_tz" }
           ],
           [
             { text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }
@@ -1150,6 +1247,58 @@ async function handleMessage(message, user, state, draft, env) {
     await sendMessage(env, chatId, `✅ منطقه زمانی با موفقیت به اختلاف ${mins} دقیقه ذخیره شد.`, {
       reply_markup: {
         inline_keyboard: [[{ text: "⚙️ بازگشت به تنظیمات", callback_data: "menu_settings" }]]
+      }
+    });
+    return;
+  }
+
+  if (state.step === "AWAITING_POST_SCHED_TZ_CUSTOM") {
+    const mins = parseInt(text);
+    if (isNaN(mins)) {
+      await sendMessage(env, chatId, "⚠️ لطفاً عدد صحیح به عنوان دقیقه وارد کنید:");
+      return;
+    }
+
+    let settings = await kv.get("settings", { type: "json" }) || {};
+    settings.timezone = "custom";
+    settings.timezoneOffset = mins;
+    settings.timezoneLabel = `دستی (UTC${mins >= 0 ? "+" : ""}${mins / 60})`;
+    await kv.put("settings", JSON.stringify(settings));
+
+    state.step = "AWAITING_SCHEDULE_TIME";
+    await kv.put(`state:${user.id}`, JSON.stringify(state));
+
+    const currentLocalTime = formatTimestamp(Date.now(), mins);
+    const schedText = `✅ <b>منطقه زمانی با موفقیت تنظیم شد!</b>\n\n🌐 منطقه زمانی: <b>${settings.timezoneLabel}</b>\n🕐 ساعت فعلی شما از نظر ربات: <b>${currentLocalTime}</b>\n\nیکی از زمان‌های پیشنهادی زیر را انتخاب کنید یا خودتان زمان خاصی بنویسید:\n\n<b>مثال‌های ورود دستی قابل قبول:</b>\n- <code>18:30</code> (امروز ساعت ۱۸:۳۰ یا فردا)\n- <code>فردا 14:00</code>\n- <code>پس فردا 21:00</code>\n- <code>2026-07-15 14:30</code> (فرمت کامل میلادی)\n\n<i>نکته: زبان ارقام (فارسی یا انگلیسی) اهمیتی ندارد.</i>`;
+    await sendMessage(env, chatId, schedText, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "⏱️ ۱۵ دقیقه دیگر", callback_data: "post_sched_preset:15m" },
+            { text: "⏱️ ۳۰ دقیقه دیگر", callback_data: "post_sched_preset:30m" }
+          ],
+          [
+            { text: "⏱️ ۱ ساعت دیگر", callback_data: "post_sched_preset:1h" },
+            { text: "⏱️ ۲ ساعت دیگر", callback_data: "post_sched_preset:2h" }
+          ],
+          [
+            { text: "⏱️ ۵ ساعت دیگر", callback_data: "post_sched_preset:5h" },
+            { text: "⏱️ ۱۲ ساعت دیگر", callback_data: "post_sched_preset:12h" }
+          ],
+          [
+            { text: "🌅 فردا صبح (۰۹:۰۰)", callback_data: "post_sched_preset:tomorrow_morning" },
+            { text: "🌌 فردا شب (۲۱:۰۰)", callback_data: "post_sched_preset:tomorrow_night" }
+          ],
+          [
+            { text: "📅 فردا همین ساعت", callback_data: "post_sched_preset:tomorrow_same" }
+          ],
+          [
+            { text: "⚙️ تنظیم منطقه زمانی (تغییر ساعت ربات)", callback_data: "post_sched_change_tz" }
+          ],
+          [
+            { text: "🔙 بازگشت به گزینه‌ها", callback_data: "post_test_confirm" }
+          ]
+        ]
       }
     });
     return;
